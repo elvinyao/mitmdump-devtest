@@ -13,7 +13,15 @@ from urllib.parse import urlsplit
 
 import yaml
 import yaml.resolver
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 IDENTIFIER = r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$"
@@ -222,16 +230,37 @@ class Config(Model):
 
     @model_validator(mode="after")
     def references(self) -> Self:
-        service_ids = [s.id for s in self.services]
-        if len(set(service_ids)) != len(service_ids):
-            raise ValueError("duplicate service id")
-        if len({r.id for r in self.rules}) != len(self.rules):
-            raise ValueError("duplicate rule id")
-        if any(r.service not in service_ids for r in self.rules):
-            raise ValueError("rule references unknown service")
-        ports = [s.port for s in self.services] + [self.admin.port]
-        if len(set(ports)) != len(ports):
-            raise ValueError("service and admin ports must be distinct")
+        def invalid(location: tuple[str | int, ...], message: str) -> None:
+            raise ValidationError.from_exception_data(
+                "Config",
+                [
+                    {
+                        "type": "value_error",
+                        "loc": location,
+                        "input": None,
+                        "ctx": {"error": ValueError(message)},
+                    }
+                ],
+            )
+
+        service_ids: set[str] = set()
+        ports: set[int] = set()
+        for index, service in enumerate(self.services):
+            if service.id in service_ids:
+                invalid(("services", index, "id"), "duplicate service id")
+            if service.port in ports:
+                invalid(("services", index, "port"), "service ports must be distinct")
+            service_ids.add(service.id)
+            ports.add(service.port)
+        rule_ids: set[str] = set()
+        for index, rule in enumerate(self.rules):
+            if rule.id in rule_ids:
+                invalid(("rules", index, "id"), "duplicate rule id")
+            if rule.service not in service_ids:
+                invalid(("rules", index, "service"), "rule references unknown service")
+            rule_ids.add(rule.id)
+        if self.admin.port in ports:
+            invalid(("admin", "port"), "admin port must differ from service ports")
         return self
 
 

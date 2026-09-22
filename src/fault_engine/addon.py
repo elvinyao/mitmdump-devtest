@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from mitmproxy import http
 
-from fault_engine.config import Config, Delay, Disconnect, Respond, Service
+from fault_engine.config import TOKEN, Config, Delay, Disconnect, Respond, Service
 from fault_engine.engine import Decision, Engine, ScenarioError
 from fault_engine.transport import TCPBridge
 
@@ -75,17 +75,15 @@ class FaultAddon:
         await asyncio.gather(*pending, return_exceptions=True)
 
     async def request(self, flow: http.HTTPFlow) -> None:
+        if not TOKEN.fullmatch(flow.request.method):
+            self._problem(flow, 400, "invalid HTTP method")
+            return
         found = self.locate(flow.client_conn.peername)
         if found is None:
             self._problem(flow, 503, "unmapped client connection")
             return
         service, bridge = found
         flow.metadata["fault_service"] = service.id
-        url = urlsplit(service.upstream)
-        flow.request.scheme = url.scheme
-        flow.request.host = url.hostname or ""
-        flow.request.port = url.port or (443 if url.scheme == "https" else 80)
-        flow.request.headers["Host"] = url.netloc
         path = flow.request.path.split("?", 1)[0]
         try:
             decision = self.engine.decide(
@@ -99,6 +97,11 @@ class FaultAddon:
             self._problem(flow, 400, str(exc))
             self._event(flow, "request", "scenario_error")
             return
+        url = urlsplit(service.upstream)
+        flow.request.scheme = url.scheme
+        flow.request.host = url.hostname or ""
+        flow.request.port = url.port or (443 if url.scheme == "https" else 80)
+        flow.request.headers["Host"] = url.netloc
         for name in self.control_headers:
             flow.request.headers.pop(name, None)
         flow.metadata["fault_decision"] = decision
@@ -129,6 +132,9 @@ class FaultAddon:
             self._event(flow, "request", action.action)
 
     async def response(self, flow: http.HTTPFlow) -> None:
+        if flow.request.method == "HEAD" and flow.response is not None:
+            # Preserve the representation length while emitting no body on the wire.
+            flow.response.raw_content = b""
         decision: Decision | None = flow.metadata.get("fault_decision")
         if (
             decision

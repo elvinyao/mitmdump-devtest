@@ -39,3 +39,8 @@ include = ["src", "tests", "examples"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fault_engine"]
+
+[tool.coverage.run]
+source = ["fault_engine"]
+branch = true
+patch = ["subprocess"]

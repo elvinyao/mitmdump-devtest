@@ -44,7 +44,7 @@ class Runtime:
 
     def url(self, service_id: str) -> str:
         service = next(s for s in self.config.services if s.id == service_id)
-        host = service.host if service.host not in {"0.0.0.0", "::"} else "127.0.0.1"
+        host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(service.host, service.host)
         if ":" in host:
             host = f"[{host}]"
         return f"http://{host}:{service.port}"
@@ -52,8 +52,7 @@ class Runtime:
     @property
     def admin_url(self) -> str:
         host = self.config.admin.host
-        if host in {"0.0.0.0", "::"}:
-            host = "127.0.0.1"
+        host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
         if ":" in host:
             host = f"[{host}]"
         return f"http://{host}:{self.config.admin.port}"
@@ -74,7 +73,11 @@ class Runtime:
             self.master.addons.add(
                 Core(), self.proxyserver, NextLayer(), TlsConfig(), DnsResolver(), self.addon
             )
-            opts.update(connection_strategy="lazy", body_size_limit=str(self.config.body_limit))
+            opts.update(
+                connection_strategy="lazy",
+                body_size_limit=str(self.config.body_limit),
+                keep_host_header=True,
+            )
             if self.config.upstream_ca:
                 opts.update(ssl_verify_upstream_trusted_ca=self.config.upstream_ca)
             if not await self.proxyserver.setup_servers():

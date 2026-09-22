@@ -83,6 +83,22 @@ async def test_real_retry_two_errors_then_upstream_once(proxy, upstream):
         assert app.engine.snapshot()[0]["count"] == 3
 
 
+async def test_two_4xx_then_fixed_mock_success_without_upstream(proxy, upstream):
+    scenario = rule(
+        {"action": "respond", "status": 400, "repeat": 2},
+        sequence=[
+            {"action": "respond", "status": 400, "repeat": 2},
+            {"action": "respond", "status": 200, "json_body": {"ok": True}},
+        ],
+        after_sequence="repeat_last",
+    )
+    async with proxy([scenario]) as app, httpx.AsyncClient() as client:
+        responses = [await client.post(app.url("orders") + "/fault") for _ in range(4)]
+        assert [response.status_code for response in responses] == [400, 400, 200, 200]
+        assert responses[2].json() == responses[3].json() == {"ok": True}
+        assert upstream[1] == []
+
+
 @pytest.mark.parametrize(
     "status", [200, 204, 205, 304, 400, 401, 404, 408, 429, 500, 502, 503, 504]
 )

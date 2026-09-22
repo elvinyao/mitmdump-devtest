@@ -1,0 +1,94 @@
+version: 1
+services:
+  - id: orders
+    host: 0.0.0.0
+    port: 8080
+    upstream: http://127.0.0.1:9000
+  - id: inventory
+    host: 0.0.0.0
+    port: 8081
+    upstream: http://127.0.0.1:9001
+admin:
+  host: 0.0.0.0
+  port: 9090
+  token_env: FAULT_ADMIN_TOKEN
+state:
+  capacity: 10000
+  ttl_seconds: 3600
+rules:
+  - id: retry-twice
+    service: orders
+    match:
+      path: /retry
+    scope: X-Test-Run-ID
+    sequence:
+      - action: respond
+        status: 429
+        headers:
+          Retry-After: '1'
+        json_body: {error: retry_later}
+        repeat: 2
+    after_sequence: passthrough
+  - id: nth-error
+    service: orders
+    match:
+      path: /nth
+    scope: X-Test-Run-ID
+    start_at: 5
+    sequence:
+      - action: respond
+        status: 503
+        repeat: 2
+  - id: fixed-success
+    service: orders
+    match:
+      path: /mock
+    sequence:
+      - action: respond
+        status: 400
+        repeat: 2
+      - action: respond
+        status: 200
+        json_body: {ok: true}
+    after_sequence: repeat_last
+  - id: before
+    service: orders
+    match: {path: /slow-before}
+    sequence:
+      - action: delay_before
+        seconds: 3
+    after_sequence: repeat_last
+  - id: after
+    service: orders
+    match: {path: /slow-after}
+    sequence:
+      - action: delay_after
+        seconds: 3
+    after_sequence: repeat_last
+  - id: no-response
+    service: orders
+    match: {path: /timeout}
+    sequence:
+      - action: timeout
+        seconds: 10
+    after_sequence: repeat_last
+  - id: tcp-reset
+    service: orders
+    match: {path: /reset}
+    sequence:
+      - action: reset
+    after_sequence: repeat_last
+  - id: disconnect
+    service: orders
+    match: {path: /disconnect}
+    sequence:
+      - action: disconnect
+    after_sequence: repeat_last
+  - id: inventory-cycle
+    service: inventory
+    match: {path: /cycle, methods: [GET, POST, PUT]}
+    sequence:
+      - action: respond
+        status: 500
+      - action: passthrough
+    after_sequence: cycle
