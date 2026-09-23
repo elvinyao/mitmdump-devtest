@@ -1,13 +1,13 @@
 # 验收记录
 
-验证日期：2026-09-22。环境：Docker/OrbStack 中的 Linux、Python 3.12.14。依赖由 uv.lock 锁定，其中 mitmproxy 12.2.3、ruff 0.16.8、ty 0.0.83、pytest 9.1.1。
+最近完整验证日期：2026-09-23。环境：Docker/OrbStack 中的 Linux、Python 3.12.14。依赖由 uv.lock 锁定，其中 mitmproxy 12.2.3、ruff 0.16.8、ty 0.0.83、pytest 9.1.1。
 
 ## 结果
 
-- **119 tests passed，0 failed，0 skipped**。
-- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**94%**（669 个 statement、198 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
+- **195 tests passed，0 failed，0 skipped**，较首轮增加 76 项。
+- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**95%**（794 个 statement、240 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
 - `uv lock --check`、`uv sync --locked`、`ruff format --check .`、`ruff check .`、`ty check` 全部通过。
-- `uv build` 生成 wheel 和 sdist。隔离安装 wheel 后运行 `fault-engine validate examples/scenarios.yaml`，返回 `valid: 2 services, 9 rules`。
+- `uv build` 生成 wheel 和 sdist。使用锁文件导出的生产依赖，在独立虚拟环境中离线安装 wheel；从 /tmp 导入 runtime，确认模块来自安装包。配置验证返回 `valid: 2 services, 22 rules`。
 - 程序和 Docker runner 都实际运行过，测试没有用 mock 替代 mitmproxy 或 TCP reset。
 - 测试保留了 **42 条第三方弃用警告**：mitmproxy 使用 pyparsing 的旧 API，以及 ldap3 对 pyasn1 旧导出的引用。没有将这些警告隐藏或描述为零警告。
 
@@ -46,12 +46,19 @@ bash .agent/run.sh bash .agent/check.sh
 | 事件和日志 | test_events_are_structured_and_redact_request_data：阶段、规则、动作和序号可读取，不记录请求体/Authorization/Cookie，scope 截断 |
 | CLI | validate/help、具体错误字段路径、秘密输入不回显、缺失 token 失败、真实 serve ready/mock/SIGTERM 子进程 |
 | 中文文档及示例 | README.md、usage.md、development.md、scenarios.yaml、demo.py；test_demo.py 用真实 curl 验证重试/状态/reset/第二个服务/退出 |
+| 后端执行后注入故障 | test_extended_scenarios.py 验证 respond_after、reset_after、disconnect_after 的真实后端调用、原始 socket RST、重试再次写入；上游连接失败仍为真实 502 |
+| 延迟 mock 与 HEAD 故障 | respond/respond_after 延迟和客户端超时不阻塞其他请求；HEAD 替换响应及 reset 失败的 503 不污染 keepalive 下一响应 |
+| HTTP 字节与解析边界 | test_http_review.py 验证混合大小写方法、已压缩二进制不二次压缩、Latin-1 头、绝对 URL 固定路由、重复 scope 拒绝、chunked 和 Expect |
+| HTTP trailers | 已声明/未声明的请求 trailer 均及时关连接且不访问后端，响应 trailer 返回 502；无 parser crash 或挂起，不宣称支持透传 |
+| 生命周期隔离 | test_lifecycle_review.py 验证慢管理请求、并发/取消 close、挂起后端、两阶段延迟、启动取消重试、第二 Runtime 拒绝以及排队关闭/启动所有权 |
+| 配置与状态额外边界 | test_state_review.py 验证版本类型、UTF-8 字节上限、错误值和字典 key 脱敏、保留头、YAML 别名、TTL 边界、700 请求/7 scope 和管理错误不改状态 |
+| 客户端业务场景 | test_example_catalog.py 执行示例规则：持续 401/409/503、HTML 错误、HTTP 200 业务错误、无效/空 JSON、307 保留 POST、超时→503→200 |
 
-测试分布：boundaries 11、CLI 6、config 36、demo 1、engine 10、integration 36、network_edges 10、transport 9。
+测试分布：boundaries 11、CLI 6、config 36、demo 1、engine 10、example_catalog 9、extended_scenarios 19、http_review 13、integration 36、lifecycle_review 9、network_edges 10、state_review 26、transport 9。
 
 ## 实际端口映射体验
 
-另外执行了 README 的 `--publish` 演示及跨容器 curl 命令，而不只测试容器内端口：
+首轮（2026-09-22）另外执行了 README 的 `--publish` 演示及跨容器 curl 命令；下表保留该环境实测记录，本轮未重复宿主机映射测试：
 
 | 操作 | 当前 OrbStack 环境的实际结果 |
 | --- | --- |
@@ -69,6 +76,8 @@ bash .agent/run.sh bash .agent/check.sh
 采用 superpowers 的设计、计划、TDD、根因定位与完成前验证流程，子代理执行 transport 实现和独立审查。先做需求审查，再做质量审查，反馈修复后复核。
 
 已修复并回归验证：背压关闭卡住、SO_LINGER 失败丢失映射、HEAD mock 破坏连接分帧、非法 method 未拒绝、原始 Host 无法匹配、跨字段配置错误缺少字段路径、IPv6 wildcard URL 指向错误地址。各审查项已关闭。
+
+第二轮先由 HTTP、状态/配置、生命周期三个方向独立检查并保留失败测试，再修复和自审。修复了慢管理请求拖延关闭、并发关闭异常、取消关闭泄漏、第二 Runtime 覆盖全局 context、错误消息泄露配置、文件大小按字符而非字节计算、压缩 mock 二次压缩、Latin-1 头编码、方法大小写和重复 scope 冲突。对锁定版本增加最小 trailer 拒绝适配；请求侧接受“明确关闭”作为拒绝契约，而非伪称一定返回 400。最终自审额外修复了排队启动时所有权被先前清理释放，以及 reset_after 失败的 HEAD body 泄漏，两者均有专门回归测试。
 
 ## 未覆盖的协议与环境
 

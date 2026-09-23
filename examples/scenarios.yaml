@@ -92,3 +92,116 @@ rules:
         status: 500
       - action: passthrough
     after_sequence: cycle
+  - id: authentication-required
+    service: orders
+    match: {path: /unauthorized}
+    sequence:
+      - action: respond
+        status: 401
+        headers: {WWW-Authenticate: 'Bearer realm="test"'}
+        json_body: {error: token_expired}
+    after_sequence: repeat_last
+  - id: write-conflict
+    service: orders
+    match: {path: /conflict, methods: [POST, PUT, PATCH]}
+    sequence:
+      - action: respond
+        status: 409
+        json_body: {error: version_conflict}
+    after_sequence: repeat_last
+  - id: retry-budget
+    service: orders
+    match: {path: /always-unavailable}
+    sequence:
+      - action: respond
+        status: 503
+        headers: {Retry-After: '1'}
+        json_body: {error: unavailable}
+    after_sequence: repeat_last
+  - id: malformed-json
+    service: orders
+    match: {path: /invalid-json}
+    sequence:
+      - action: respond
+        status: 200
+        headers: {Content-Type: application/json}
+        body: '{"incomplete":'
+    after_sequence: repeat_last
+  - id: html-gateway-error
+    service: orders
+    match: {path: /html-error}
+    sequence:
+      - action: respond
+        status: 502
+        headers: {Content-Type: text/html}
+        body: '<html><body>Bad Gateway</body></html>'
+    after_sequence: repeat_last
+  - id: empty-json-response
+    service: orders
+    match: {path: /empty-json}
+    sequence:
+      - action: respond
+        status: 200
+        headers: {Content-Type: application/json}
+    after_sequence: repeat_last
+  - id: business-error
+    service: orders
+    match: {path: /business-error}
+    sequence:
+      - action: respond
+        status: 200
+        json_body: {ok: false, error: quota_exceeded}
+    after_sequence: repeat_last
+  - id: preserve-method-redirect
+    service: orders
+    match: {path: /redirect}
+    sequence:
+      - action: respond
+        status: 307
+        headers: {Location: /echo}
+    after_sequence: repeat_last
+  - id: slow-mock
+    service: orders
+    match: {path: /slow-mock}
+    sequence:
+      - action: respond
+        status: 200
+        delay_seconds: 3
+        json_body: {ok: true}
+    after_sequence: repeat_last
+  - id: write-then-error
+    service: orders
+    match: {path: /write-then-error, methods: [POST]}
+    scope: X-Test-Run-ID
+    sequence:
+      - action: respond_after
+        status: 503
+        json_body: {error: acknowledgement_lost}
+    after_sequence: passthrough
+  - id: write-then-reset
+    service: orders
+    match: {path: /write-then-reset, methods: [POST]}
+    scope: X-Test-Run-ID
+    sequence:
+      - action: reset_after
+    after_sequence: passthrough
+  - id: write-then-disconnect
+    service: orders
+    match: {path: /write-then-disconnect, methods: [POST]}
+    scope: X-Test-Run-ID
+    sequence:
+      - action: disconnect_after
+    after_sequence: passthrough
+  - id: mixed-retry
+    service: orders
+    match: {path: /mixed-retry}
+    scope: X-Test-Run-ID
+    sequence:
+      - action: timeout
+        seconds: 3
+      - action: respond
+        status: 503
+      - action: respond
+        status: 200
+        json_body: {ok: true}
+    after_sequence: repeat_last

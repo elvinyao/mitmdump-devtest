@@ -26,11 +26,20 @@ from pydantic import (
 TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 IDENTIFIER = r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$"
 Port = Annotated[int, Field(ge=1, le=65535)]
+CONFIG_BYTE_LIMIT = 1_048_576
 
 
 def header_name(value: str) -> str:
     if not TOKEN.fullmatch(value):
         raise ValueError("invalid HTTP header name")
+    return value
+
+
+def listen_host(value: str) -> str:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ValueError("host must be an IPv4 or IPv6 address") from exc
     return value
 
 
@@ -47,13 +56,16 @@ class Service(Model):
     @field_validator("host")
     @classmethod
     def valid_host(cls, value: str) -> str:
-        ipaddress.ip_address(value)
-        return value
+        return listen_host(value)
 
     @field_validator("upstream")
     @classmethod
     def valid_upstream(cls, value: str) -> str:
-        url = urlsplit(value)
+        try:
+            url = urlsplit(value)
+            port = url.port
+        except ValueError as exc:
+            raise ValueError("upstream must have a valid host and port") from exc
         if (
             url.scheme not in {"http", "https"}
             or not url.hostname
@@ -70,7 +82,7 @@ class Service(Model):
             raise ValueError(
                 "upstream must be an http(s) origin without credentials, path or query"
             )
-        if url.port == 0:
+        if port == 0:
             raise ValueError("upstream port must be positive")
         return value.rstrip("/")
 
@@ -86,7 +98,7 @@ class Match(Model):
     @classmethod
     def valid_methods(cls, value: list[str] | None) -> list[str] | None:
         if value is not None and (
-            not value or any(not TOKEN.fullmatch(m) or m == "CONNECT" for m in value)
+            not value or any(not TOKEN.fullmatch(m) or m.upper() == "CONNECT" for m in value)
         ):
             raise ValueError("methods must be nonempty HTTP tokens excluding CONNECT")
         return value
@@ -122,8 +134,9 @@ class Pass(Step):
 
 
 class Respond(Step):
-    action: Literal["respond"]
+    action: Literal["respond", "respond_after"]
     status: int = Field(ge=200, le=599)
+    delay_seconds: float = Field(default=0, ge=0, le=3600)
     headers: dict[str, str] = Field(default_factory=dict)
     body: str | None = None
     json_body: JsonValue = None
@@ -170,7 +183,7 @@ class Delay(Step):
 
 
 class Disconnect(Step):
-    action: Literal["disconnect", "reset"]
+    action: Literal["disconnect", "reset", "disconnect_after", "reset_after"]
 
 
 Action = Annotated[Pass | Respond | Delay | Disconnect, Field(discriminator="action")]
@@ -197,6 +210,16 @@ class Rule(Model):
                 "content-length",
                 "transfer-encoding",
                 "connection",
+                "proxy-authorization",
+                "proxy-authenticate",
+                "proxy-connection",
+                "keep-alive",
+                "te",
+                "trailer",
+                "upgrade",
+                "expect",
+                "content-type",
+                "content-encoding",
             }:
                 raise ValueError("use a dedicated non-sensitive test scope header")
         return value
@@ -215,8 +238,7 @@ class AdminConfig(Model):
     @field_validator("host")
     @classmethod
     def valid_host(cls, value: str) -> str:
-        ipaddress.ip_address(value)
-        return value
+        return listen_host(value)
 
 
 class Config(Model):
@@ -227,6 +249,13 @@ class Config(Model):
     admin: AdminConfig = Field(default_factory=AdminConfig)
     body_limit: int = Field(default=10_485_760, ge=1, le=1_073_741_824)
     upstream_ca: str | None = None
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def strict_version(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("version must be the integer 1")
+        return value
 
     @model_validator(mode="after")
     def references(self) -> Self:
@@ -285,7 +314,12 @@ UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, 
 
 
 def load_config(path: str | Path) -> Config:
-    source = Path(path).read_text(encoding="utf-8")
-    if len(source) > 1_048_576:
+    with Path(path).open("rb") as stream:
+        source = stream.read(CONFIG_BYTE_LIMIT + 1)
+    if len(source) > CONFIG_BYTE_LIMIT:
         raise ValueError("configuration exceeds 1 MiB")
-    return Config.model_validate(yaml.load(source, Loader=UniqueKeyLoader))
+    try:
+        text = source.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("configuration must use UTF-8 encoding") from exc
+    return Config.model_validate(yaml.load(text, Loader=UniqueKeyLoader))

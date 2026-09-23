@@ -14,6 +14,8 @@
 
 不为每个服务创建一个 Master：mitmproxy 使用进程级 context。同一进程应只有一个 Runtime，多服务共用一个 Master 和一个内部监听器。`Runtime.start()` 显式调用 proxyserver setup 与 Master running lifecycle，`close()` 按逆序清理管理服务、桥接连接、延迟 hook、内部监听器、Master 和临时证书目录。mitmproxy 的嵌入接口升级后必须重新跑集成测试。
 
+Runtime 现在在构造 Master 前拒绝第二个活跃实例。生命周期锁串行化启动和清理，并发 close 共享受 shield 保护的清理任务；取消 close 的调用者不会取消后台清理。管理请求关闭宽限为 0.2 秒，未完成的请求体不能让关闭等待默认的 60 秒。启动取消或失败后释放监听器和进程占用，可重新启动。API 应在同一 asyncio event loop 内使用。
+
 ## 源文件职责
 
 | 文件 | 职责 |
@@ -24,6 +26,7 @@
 | transport.py | 不解析 HTTP 的 TCP 字节中继、地址映射、SO_LINGER RST |
 | admin.py | 独立 aiohttp 管理 API、鉴权、输入大小和 reset 校验 |
 | runtime.py | 组装、启动、异常回滚和关闭 |
+| http1_compat.py | 活跃 Runtime 期间安装并在关闭后恢复的 trailer 拒绝适配 |
 | cli.py / __main__.py | validate / serve、token 环境变量、信号处理与退出码 |
 
 ## 状态与并发不变量
@@ -69,6 +72,11 @@ Python 固定 3.12，mitmproxy 限定 12 系列并由 uv.lock 固定实际版本
 - network_edges 覆盖私有 CA TLS、证书拒绝、多服务、HEAD keepalive、取消和在途 reset。
 - boundaries 验证非法方法、原始 Host 匹配、控制头移除、容量、日志、大小上限和端口释放。
 - CLI 和 demo 测试使用子进程，实际运行 curl 与 SIGTERM；超时断言用有边界的等待，不要求精确毫秒。
+- http_review 使用原始 HTTP 字节验证 method 大小写、压缩 body、Latin-1、chunked、Expect、绝对 URL 和 trailer 拒绝。
+- lifecycle_review 覆盖并发关闭、调用者取消、慢管理请求、启动回滚和进程全局状态隔离。
+- state_review 覆盖错误脱敏、配置字节边界、保留 scope 头、多 scope 并发与 TTL；example_catalog 实际执行仓库中的示例规则。
+
+`http1_compat.py` 有意适配 mitmproxy 12.2.3 的私有 HTTP/1 reader 工厂：h11 解析出非空 trailer 时转为协议错误，避免依赖内部抛出未处理的 NotImplementedError。没有复制整套 HTTP parser，也不静默丢弃 trailer。依赖升级必须重跑请求和响应两个方向的真实字节测试；上游原生处理修复后应移除此适配。请求侧原生错误路径会先关连接，不能承诺返回 400；响应侧为 502。
 
 采用 superpowers 的设计审批、TDD、根因排查、独立审查和完成前验证。先复现缺失行为或缺陷，再改实现。不要把网络异常全部放宽为“任何 exception”来让测试通过；reset 的原始 socket 断言必须保留。
 

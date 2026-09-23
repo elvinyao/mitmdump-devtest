@@ -74,21 +74,60 @@ class FaultAddon:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
 
+    async def _respond(self, flow: http.HTTPFlow, action: Respond) -> None:
+        if action.delay_seconds:
+            await self._sleep(action.delay_seconds)
+        headers = dict(action.headers)
+        if "json_body" in action.model_fields_set and not any(
+            k.lower() == "content-type" for k in headers
+        ):
+            headers["Content-Type"] = "application/json"
+        # Response.make(content=...) applies Content-Encoding automatically. Scenario
+        # bodies already describe the wire representation, including compressed bytes.
+        flow.response = http.Response.make(
+            action.status,
+            b"",
+            [(name.encode("ascii"), value.encode("latin-1")) for name, value in headers.items()],
+        )
+        content = action.body_bytes()
+        flow.response.raw_content = content
+        flow.response.headers["Content-Length"] = str(len(content))
+        if action.status in {204, 304}:
+            flow.response.headers.pop("content-length", None)
+
+    def _disconnect(self, flow: http.HTTPFlow, action: Disconnect) -> bool:
+        if action.action in {"reset", "reset_after"}:
+            found = self.locate(flow.client_conn.peername)
+            if found is None or not found[1].reset(flow.client_conn.peername):
+                self._problem(flow, 503, "TCP reset failed: connection mapping unavailable")
+                self._event(flow, "fault", "reset_failed")
+                return False
+        flow.kill()
+        self._event(flow, "fault", action.action)
+        return True
+
     async def request(self, flow: http.HTTPFlow) -> None:
-        if not TOKEN.fullmatch(flow.request.method):
+        # mitmproxy's convenience getter uppercases method names; HTTP tokens are
+        # case sensitive and custom method rules must match the actual wire token.
+        method = flow.request.data.method.decode("ascii", "surrogateescape")
+        if not TOKEN.fullmatch(method):
             self._problem(flow, 400, "invalid HTTP method")
             return
         found = self.locate(flow.client_conn.peername)
         if found is None:
             self._problem(flow, 503, "unmapped client connection")
             return
-        service, bridge = found
+        service, _ = found
         flow.metadata["fault_service"] = service.id
+        if any(len(flow.request.headers.get_all(name)) > 1 for name in self.control_headers):
+            self._problem(flow, 400, "test scope header must occur only once")
+            self._event(flow, "request", "scenario_error")
+            return
         path = flow.request.path.split("?", 1)[0]
         try:
             decision = self.engine.decide(
                 service.id,
-                flow.request.method,
+                method,
                 path,
                 dict(flow.request.headers),
                 list(flow.request.query.items(multi=True)),
@@ -101,6 +140,7 @@ class FaultAddon:
         flow.request.scheme = url.scheme
         flow.request.host = url.hostname or ""
         flow.request.port = url.port or (443 if url.scheme == "https" else 80)
+        flow.request.authority = ""
         flow.request.headers["Host"] = url.netloc
         for name in self.control_headers:
             flow.request.headers.pop(name, None)
@@ -109,40 +149,32 @@ class FaultAddon:
         if decision is None:
             return
         action = decision.action
-        if isinstance(action, Respond):
-            headers = dict(action.headers)
-            if "json_body" in action.model_fields_set and not any(
-                k.lower() == "content-type" for k in headers
-            ):
-                headers["Content-Type"] = "application/json"
-            flow.response = http.Response.make(action.status, action.body_bytes(), headers)
-            if action.status in {204, 304}:
-                flow.response.headers.pop("content-length", None)
+        if isinstance(action, Respond) and action.action == "respond":
+            await self._respond(flow, action)
         elif isinstance(action, Delay) and action.action != "delay_after":
             await self._sleep(action.seconds)
             if action.action == "timeout":
                 flow.kill()
                 self._event(flow, "request", "hold_expired")
-        elif isinstance(action, Disconnect):
-            if action.action == "reset" and not bridge.reset(flow.client_conn.peername):
-                self._problem(flow, 503, "TCP reset failed: connection mapping unavailable")
-                self._event(flow, "request", "reset_failed")
-                return
-            flow.kill()
-            self._event(flow, "request", action.action)
+        elif isinstance(action, Disconnect) and action.action in {"reset", "disconnect"}:
+            self._disconnect(flow, action)
 
     async def response(self, flow: http.HTTPFlow) -> None:
+        decision: Decision | None = flow.metadata.get("fault_decision")
+        if decision:
+            action = decision.action
+            if action.action in {"delay_after", "respond_after", "reset_after", "disconnect_after"}:
+                self._event(flow, "response", "upstream_received")
+                if isinstance(action, Delay):
+                    await self._sleep(action.seconds)
+                elif isinstance(action, Respond):
+                    await self._respond(flow, action)
+                elif isinstance(action, Disconnect):
+                    if self._disconnect(flow, action):
+                        return
         if flow.request.method == "HEAD" and flow.response is not None:
             # Preserve the representation length while emitting no body on the wire.
             flow.response.raw_content = b""
-        decision: Decision | None = flow.metadata.get("fault_decision")
-        if (
-            decision
-            and isinstance(decision.action, Delay)
-            and decision.action.action == "delay_after"
-        ):
-            self._event(flow, "response", "upstream_received")
-            await self._sleep(decision.action.seconds)
         self._event(
             flow, "response", str(flow.response.status_code) if flow.response else "missing"
         )

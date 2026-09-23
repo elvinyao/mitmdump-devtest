@@ -79,7 +79,7 @@ rules:
 
 HTTPS upstream 默认验证证书，系统信任根可直接使用；私有 CA 可配置 `upstream_ca: /workspace/certs/ca.pem`。CA 路径在容器中解析。当前未提供绕过证书校验的配置。
 
-配置不热加载；修改后重启。未知字段、重复 YAML key、无效引用和不合法的动作组合会在启动前拒绝。
+配置不热加载；修改后重启。文件使用 UTF-8，最大 1 MiB（按字节计）。未知字段、重复 YAML key、无效引用和不合法的动作组合会在启动前拒绝。version 只接受整数 1。
 
 ## 3. 匹配和计数
 
@@ -92,6 +92,7 @@ HTTPS upstream 默认验证证书，系统信任根可直接使用；私有 CA �
 - `scope: global` 是默认值，所有匹配该规则的请求共享计数。其他值代表请求头名，例如 `X-Test-Run-ID`。
 - 计数键为 `(服务, 规则, scope值)`。同一逻辑调用的重试使用相同 scope；并发测试或不同逻辑调用使用不同 scope。
 - scope 头缺失、为空或超过 256 字符返回 **400 + `X-Fault-Engine-Error: scenario`**，不消耗次数。它与刻意模拟的业务错误不同。
+- 配置的 scope 头在同一请求中只能出现一次；重复头返回 400，不消耗次数，避免合并后的值与另一个测试 ID 冲突。
 - 所有配置中的 scope 控制头默认在转发前删除，包括未匹配请求。禁止使用 Authorization/Cookie/Host 等保留头作为 scope。
 
 序号从 1 开始，先分配再执行延迟。并发请求按进入引擎的顺序分配，不保证按响应完成顺序递增。请求取消仍消耗已分配序号。
@@ -115,16 +116,50 @@ HTTPS upstream 默认验证证书，系统信任根可直接使用；私有 CA �
 | action | 参数 | 行为 |
 | --- | --- | --- |
 | passthrough | 无 | 访问真实后端 |
-| respond | status、可选 headers/body/json_body/body_base64 | 不访问后端，生成最终 HTTP 响应 |
+| respond | status、可选 headers/body/json_body/body_base64、delay_seconds | 不访问后端，生成最终 HTTP 响应 |
+| respond_after | 与 respond 相同 | 收到完整后端响应后，将其替换为配置的响应 |
 | delay_before | seconds | 转发前异步等待，然后正常转发 |
 | delay_after | seconds | 收到完整后端响应后，再延迟交付客户端 |
 | timeout | seconds | 不访问后端，在有限时间内不响应，时间到后终止请求 |
 | disconnect | 无 | 终止当前 flow，不承诺特定 TCP 标志或 errno |
 | reset | 无 | 对该客户端 TCP 连接发送真实 RST |
+| disconnect_after | 无 | 收到完整后端响应后终止 flow |
+| reset_after | 无 | 收到完整后端响应后，对客户端连接发送真实 RST |
 
 `seconds` 必须大于 0 且不超过 3600。测试客户端读超时时，让 seconds 明显大于客户端 timeout。delay_before 到期后如果客户端已断开，不承诺仍会写入后端；验证“后端已成功而客户端超时”应使用 delay_after。
 
 `respond.status` 接受 200–599；1xx 是中间响应，不能作为该动作的最终响应。文本使用 UTF-8，json_body 自动生成 JSON Content-Type，body_base64 用于二进制。三种 body 字段互斥；`json_body: null` 表示 JSON null。headers 值须为字符串，例如 `Retry-After: '1'`。Content-Length 等分帧头由程序管理，不能手动配置。204/205/304 不允许非空 body，HEAD 不发送 body。
+
+`respond` 和 `respond_after` 的 `delay_seconds` 默认为 0，允许 0–3600；等待期间不阻塞其他请求。响应头按 Latin-1 编码，body 为实际发送的字节，不根据 Content-Encoding 自动压缩。模拟 gzip 时，将已压缩内容放入 body_base64，并配置 `Content-Encoding: gzip`；也可以故意提供错误编码，测试客户端解码失败。
+
+后置动作适合验证写入幂等性：例如 POST 已到达后端，但客户端只看到 503 或断连，再重试可能造成第二次写入。它们只在收到完整 HTTP 响应后触发；如果上游连接/TLS 失败或返回不完整响应，保留真实代理错误，不执行替换或后置 reset。是否真正完成业务写入仍需检查后端记录，HTTP 响应本身不是业务提交证明。
+
+### 可直接运行的客户端场景
+
+`examples/scenarios.yaml` 含 22 条规则，完整演示自动加载。下表列出新增路径；原有 /retry、/nth、/mock、/slow-before、/slow-after、/timeout、/reset、/disconnect 和 inventory /cycle 仍可使用。
+
+| orders 路径 | 预期结果 / 检查点 |
+| --- | --- |
+| /unauthorized | 持续 401、WWW-Authenticate；检查客户端是否按约定停止重试 |
+| /conflict（POST/PUT/PATCH） | 持续 409，版本冲突处理 |
+| /always-unavailable | 持续 503、Retry-After；检查重试预算和最终错误 |
+| /invalid-json、/empty-json | HTTP 200，但 JSON 解析失败 |
+| /html-error | HTTP 502 + HTML，检查非 JSON 错误体处理 |
+| /business-error | HTTP 200 + `ok: false`，检查业务错误识别 |
+| /redirect | 307 到 /echo，检查 POST 方法和 body 保留 |
+| /slow-mock | 等待 3 秒后固定 200，不访问后端 |
+| /write-then-error（POST） | 第一次后端执行后返回 503，后续透传 |
+| /write-then-reset（POST） | 第一次后端响应后 RST，后续透传 |
+| /write-then-disconnect（POST） | 第一次后端响应后断连，后续透传 |
+| /mixed-retry | 不响应 3 秒、503、固定 200；客户端 timeout 应小于 3 秒 |
+
+最后四条规则要求 `X-Test-Run-ID`；每次逻辑测试使用新 ID，重试保持同一个 ID。例如：
+
+```bash
+bash .agent/run.sh sh -c 'for i in 1 2; do curl -sS -X POST -d "payment=1" -H "X-Test-Run-ID: write-demo" http://host.docker.internal:18080/write-then-error; done'
+```
+
+第二次返回演示后端记录；后端累计次数包含其他请求，精确比较时先记录基线。引擎只制造场景，不自动判定客户端重试策略是否符合你的业务要求。
 
 ### 超时、504 和 errno 104
 
@@ -185,3 +220,5 @@ bash .agent/run.sh curl -sS -X POST -H 'Authorization: Bearer local-demo-token' 
 真实上游连接或 TLS 校验失败通常由 mitmproxy 返回 502；这与 respond 生成的 502 不同，可用选中动作日志和后端调用次数区分。场景配置约定错误携带 `X-Fault-Engine-Error: scenario`。
 
 当前缓冲请求/响应体，上限默认为 10 MiB；不保证流式/SSE 或无限响应。HTTP/2 被禁用，以保持连接级故障可复现。当前客户端入口只验证 HTTP/1.1 明文访问；HTTPS 是指代理到后端的链路。
+
+当前不支持非空 HTTP trailers：带 trailer 的请求会立即关闭连接且不访问后端；后端响应带 trailer 则返回 502。普通 chunked 请求、chunk extension 和 100-continue 已验证。这个明确拒绝行为避免当前 mitmproxy 版本在 trailer 解析后异常并让客户端一直等待。

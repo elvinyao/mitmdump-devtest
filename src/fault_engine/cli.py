@@ -14,6 +14,29 @@ from pydantic import ValidationError
 from fault_engine.config import Config, load_config
 
 
+def config_error_location(location: tuple[str | int, ...]) -> str:
+    """Keep schema field names and indices; never print user-supplied mapping keys."""
+    schema = Config.model_json_schema()
+    definitions = schema.get("$defs", {})
+    node = schema
+    safe = []
+    for part in location:
+        while "$ref" in node:
+            node = definitions[node["$ref"].rsplit("/", 1)[-1]]
+        if isinstance(part, int) and node.get("type") == "array":
+            safe.append(str(part))
+            node = node["items"]
+        elif isinstance(part, str) and part in node.get("properties", {}):
+            safe.append(part)
+            node = node["properties"][part]
+        elif part in node.get("discriminator", {}).get("mapping", {}):
+            safe.append(str(part))
+            node = {"$ref": node["discriminator"]["mapping"][part]}
+        else:
+            break
+    return ".".join(safe) or "<root>"
+
+
 async def serve(config: Config, token: str) -> None:
     from fault_engine.runtime import Runtime
 
@@ -62,8 +85,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except ValidationError as exc:
         for error in exc.errors(include_input=False, include_context=False, include_url=False):
-            location = ".".join(str(part) for part in error["loc"])
-            print(f"config {location}: {error['msg']}", file=sys.stderr)
+            location = config_error_location(error["loc"])
+            message = {
+                "union_tag_invalid": "unknown action; choose a supported action",
+                "union_tag_not_found": "action is required",
+            }.get(error["type"], error["msg"])
+            print(f"config {location}: {message}", file=sys.stderr)
     except yaml.YAMLError:
         print("config: invalid YAML syntax", file=sys.stderr)
     except (OSError, ValueError, RuntimeError) as exc:
