@@ -205,3 +205,83 @@ rules:
         status: 200
         json_body: {ok: true}
     after_sequence: repeat_last
+  # All match fields must agree; retries reuse the same scope header.
+  - id: targeted-write-retry
+    service: orders
+    match:
+      methods: [POST, PUT]
+      path_regex: /payments/[0-9]+
+      headers: {X-Client: mobile}
+      query: {mode: fault}
+    scope: X-Test-Run-ID
+    sequence:
+      - action: respond
+        status: 429
+        headers: {Retry-After: '1'}
+        json_body: {error: targeted_rate_limit}
+        repeat: 2
+    after_sequence: passthrough
+  # The health exception must appear before the broader maintenance rule.
+  - id: maintenance-health-exception
+    service: orders
+    match: {path: /maintenance/health, methods: [GET]}
+    sequence:
+      - action: passthrough
+    after_sequence: repeat_last
+  - id: maintenance-window
+    service: orders
+    match: {path_regex: '/maintenance/.*'}
+    sequence:
+      - action: respond
+        status: 503
+        headers: {Retry-After: '5'}
+        json_body: {error: maintenance}
+    after_sequence: repeat_last
+  # Warm up once, then alternate two failures and two real backend responses.
+  - id: recovery-cycle
+    service: orders
+    match: {path: /recovery-cycle}
+    scope: X-Test-Run-ID
+    start_at: 3
+    sequence:
+      - action: respond
+        status: 503
+        repeat: 2
+      - action: passthrough
+        repeat: 2
+    after_sequence: cycle
+  - id: cached-resource
+    service: orders
+    match:
+      path: /cached
+      methods: [GET, HEAD]
+      headers: {If-None-Match: '"demo-v1"'}
+    sequence:
+      - action: respond
+        status: 304
+        headers: {ETag: '"demo-v1"'}
+    after_sequence: repeat_last
+  - id: delete-no-content
+    service: orders
+    match: {path: /no-content, methods: [DELETE]}
+    sequence:
+      - action: respond
+        status: 204
+    after_sequence: repeat_last
+  - id: binary-download
+    service: orders
+    match: {path: /binary, methods: [GET, HEAD]}
+    sequence:
+      - action: respond
+        status: 200
+        headers: {Content-Type: application/octet-stream}
+        body_base64: AAH/gA==
+    after_sequence: repeat_last
+  - id: gateway-timeout
+    service: orders
+    match: {path: /gateway-timeout}
+    sequence:
+      - action: respond
+        status: 504
+        json_body: {error: gateway_timeout}
+    after_sequence: repeat_last

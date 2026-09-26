@@ -35,6 +35,8 @@ Runtime 现在在构造 Master 前拒绝第二个活跃实例。生命周期锁�
 
 状态键为 `(service, rule, scope)`。OrderedDict 按最后命中排序，先移除过期键，再检查容量；不会为新 scope 静默踢掉活跃场景。reset 删除计数，不修改已经选中的 Decision。尚未命中规则的请求不占用状态容量。
 
+`snapshot()` 与 `reset()` 共用 `_matching_keys()`，先清理过期条目再执行 service/rule/scope 的 AND 精确过滤；读取不会刷新最后命中时间。管理 `/state` 拒绝未知或重复 query 参数，避免拼写错误被当成无过滤查询。`/rules` 通过字段允许列表输出动作摘要；新增动作时显式决定哪些参数可公开，不要直接序列化完整规则。
+
 规则与动作 pydantic 对象禁止字段赋值，但其 list/dict 不作深层冻结；它们是启动后只读的内部数据，不提供热修改 API。扩展时如引入动态配置，应增加不可变快照及版本化状态迁移，不要直接修改列表。
 
 ## RST 与关闭
@@ -61,6 +63,10 @@ bash .agent/run.sh bash .agent/check.sh
 
 Python 固定 3.12，mitmproxy 限定 12 系列并由 uv.lock 固定实际版本。runner 引导 uv 0.12.17。`.venv-docker` 不能在 macOS 宿主机运行。ruff/ty 排除该第三方虚拟环境，ty 检查 src、tests 和 examples。
 
+runner 的 `--help` 与缺少命令提示无需 Docker；实际执行仍全部经 Docker。容器入口将缓存中的 uv/uvx 链接到 `/usr/local/bin`，保证 `sh -lc` 重置 PATH 后仍能找到工具。`tests/test_runner.py` 在容器内用替代 Docker CLI 验证参数原样传递、发布地址、工作目录和失败退出码，不启动嵌套容器。
+
+`fault-engine schema` 直接从 Pydantic 模型输出 JSON Schema，不另存一份需要同步的静态定义。YAML 错误只输出行列；字段错误只保留已知 schema 路径，禁止回显配置值或自定义字典 key。
+
 依赖升级使用 `bash .agent/run.sh uv lock --upgrade-package <package>`，随后执行完整 check。runner 的多个容器共享虚拟环境；不要并发修改依赖或格式化同一文件。无需 sudo 在宿主机安装工具。
 
 ## 测试策略
@@ -75,6 +81,7 @@ Python 固定 3.12，mitmproxy 限定 12 系列并由 uv.lock 固定实际版本
 - http_review 使用原始 HTTP 字节验证 method 大小写、压缩 body、Latin-1、chunked、Expect、绝对 URL 和 trailer 拒绝。
 - lifecycle_review 覆盖并发关闭、调用者取消、慢管理请求、启动回滚和进程全局状态隔离。
 - state_review 覆盖错误脱敏、配置字节边界、保留 scope 头、多 scope 并发与 TTL；example_catalog 实际执行仓库中的示例规则。
+- maintainability 覆盖管理过滤、摘要脱敏和过期 reset；example_catalog 还验证完整规则目录的可达性，避免宽泛规则遮蔽其他例子。
 
 `http1_compat.py` 有意适配 mitmproxy 12.2.3 的私有 HTTP/1 reader 工厂：h11 解析出非空 trailer 时转为协议错误，避免依赖内部抛出未处理的 NotImplementedError。没有复制整套 HTTP parser，也不静默丢弃 trailer。依赖升级必须重跑请求和响应两个方向的真实字节测试；上游原生处理修复后应移除此适配。请求侧原生错误路径会先关连接，不能承诺返回 400；响应侧为 502。
 
@@ -86,7 +93,7 @@ Python 固定 3.12，mitmproxy 限定 12 系列并由 uv.lock 固定实际版本
 2. 先添加配置和行为失败测试。Engine 只负责选择动作，一般不需为新动作增加网络分支。
 3. 在 addon 对应阶段实现动作。需要 TCP 行为时通过 transport 接口，不能直接访问私有 socket 或把 kill 叫作 reset。
 4. 添加真实客户端集成测试，同时断言后端是否收到请求、其他连接是否受影响。
-5. 更新使用文档的动作表、示例和验收映射，跑整套 check。
+5. 更新使用文档的动作表、场景手册、示例和验收映射，跑整套 check。目录测试会读取真实 YAML；添加正则匹配示例时，在代表路径表补一个可匹配请求。
 
 ## 当前边界
 

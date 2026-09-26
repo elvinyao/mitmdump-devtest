@@ -302,10 +302,11 @@ def _mapping(loader: UniqueKeyLoader, node: yaml.MappingNode) -> dict:
     result = {}
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=True)
+        location = f"line {key_node.start_mark.line + 1}, column {key_node.start_mark.column + 1}"
         if not isinstance(key, str):
-            raise ValueError("YAML mapping keys must be strings")
+            raise ValueError(f"YAML mapping keys must be strings at {location}")
         if key in result:
-            raise ValueError("duplicate YAML mapping key")
+            raise ValueError(f"duplicate YAML mapping key at {location}")
         result[key] = loader.construct_object(value_node, deep=True)
     return result
 

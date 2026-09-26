@@ -8,9 +8,18 @@
 bash .agent/run.sh uv sync --locked
 bash .agent/run.sh uv run fault-engine --help
 bash .agent/run.sh uv run fault-engine validate examples/scenarios.yaml
+bash .agent/run.sh uv run fault-engine schema
 ```
 
-`validate` 不启动网络服务，也不要求管理 token。字段错误返回非零退出码并指出配置路径。
+`validate` 不启动网络服务，也不要求管理 token。字段错误返回退出码 2 并指出配置路径；YAML 语法、重复键和非字符串键错误给出从 1 开始的行列位置，不回显输入内容。未知动作提示列出可选动作。
+
+`schema` 无需配置文件或 token，直接输出从当前模型生成的 JSON Schema，可供编辑器或其他工具使用；服务引用、端口冲突等跨字段规则仍以 `validate` 为准。需要保存时将重定向放在容器内：
+
+```bash
+bash .agent/run.sh sh -lc 'uv run fault-engine schema > /tmp/fault-engine.schema.json && cat /tmp/fault-engine.schema.json'
+```
+
+上面的 `/tmp` 文件随容器退出删除；持久保存可将路径改为 `/workspace/` 下的自选文件。runner 无参数时显示用法并返回 2，`--help` 不需要 Docker；普通项目命令需要 Docker/OrbStack 正在运行。
 
 ### 完整演示
 
@@ -136,30 +145,9 @@ HTTPS upstream 默认验证证书，系统信任根可直接使用；私有 CA �
 
 ### 可直接运行的客户端场景
 
-`examples/scenarios.yaml` 含 22 条规则，完整演示自动加载。下表列出新增路径；原有 /retry、/nth、/mock、/slow-before、/slow-after、/timeout、/reset、/disconnect 和 inventory /cycle 仍可使用。
+完整演示自动加载 `examples/scenarios.yaml` 的 30 条规则。[场景手册](scenarios.md)集中维护路径、规则 ID、匹配前提、scope 要求和预期结果，另附定向故障、写入重试和循环恢复命令。
 
-| orders 路径 | 预期结果 / 检查点 |
-| --- | --- |
-| /unauthorized | 持续 401、WWW-Authenticate；检查客户端是否按约定停止重试 |
-| /conflict（POST/PUT/PATCH） | 持续 409，版本冲突处理 |
-| /always-unavailable | 持续 503、Retry-After；检查重试预算和最终错误 |
-| /invalid-json、/empty-json | HTTP 200，但 JSON 解析失败 |
-| /html-error | HTTP 502 + HTML，检查非 JSON 错误体处理 |
-| /business-error | HTTP 200 + `ok: false`，检查业务错误识别 |
-| /redirect | 307 到 /echo，检查 POST 方法和 body 保留 |
-| /slow-mock | 等待 3 秒后固定 200，不访问后端 |
-| /write-then-error（POST） | 第一次后端执行后返回 503，后续透传 |
-| /write-then-reset（POST） | 第一次后端响应后 RST，后续透传 |
-| /write-then-disconnect（POST） | 第一次后端响应后断连，后续透传 |
-| /mixed-retry | 不响应 3 秒、503、固定 200；客户端 timeout 应小于 3 秒 |
-
-最后四条规则要求 `X-Test-Run-ID`；每次逻辑测试使用新 ID，重试保持同一个 ID。例如：
-
-```bash
-bash .agent/run.sh sh -c 'for i in 1 2; do curl -sS -X POST -d "payment=1" -H "X-Test-Run-ID: write-demo" http://host.docker.internal:18080/write-then-error; done'
-```
-
-第二次返回演示后端记录；后端累计次数包含其他请求，精确比较时先记录基线。引擎只制造场景，不自动判定客户端重试策略是否符合你的业务要求。
+引擎只制造场景，不自动判定客户端重试策略是否符合业务要求。演示后端返回的累计调用次数包含其他请求，比较前请记录基线。
 
 ### 超时、504 和 errno 104
 
@@ -180,8 +168,8 @@ bash .agent/run.sh uv run pytest tests/test_integration.py::test_real_reset_and_
 以下命令从另一个 runner 容器访问已发布的演示端口：
 
 ```bash
-# 同一 scope：429、429、200
-bash .agent/run.sh sh -c 'for i in 1 2 3; do curl -sS -o /dev/null -w "%{http_code}\n" -H "X-Test-Run-ID: demo" http://host.docker.internal:18080/retry; done'
+# 首次使用 usage-demo：429、429、200；重跑前换 ID 或 reset
+bash .agent/run.sh sh -c 'for i in 1 2 3; do curl -sS -o /dev/null -w "%{http_code}\n" -H "X-Test-Run-ID: usage-demo" http://host.docker.internal:18080/retry; done'
 
 # 超时；curl 非零退出是预期结果
 bash .agent/run.sh curl --max-time 1 http://host.docker.internal:18080/timeout
@@ -202,16 +190,21 @@ bash .agent/run.sh curl -v http://host.docker.internal:18080/reset
 | 接口 | 响应 |
 | --- | --- |
 | GET /health | `{"status":"ok"}` |
-| GET /rules | 规则 ID、服务、scope、起始序号、动作摘要，不暴露 mock body |
-| GET /state | `{"counters":[{"service":"orders","rule":"retry-twice","scope":"demo","count":3}]}` |
+| GET /rules | 规则 ID、服务、scope、起始序号、匹配摘要和动作参数，不暴露 mock body 或 header/query 值 |
+| GET /state | 可选 service/rule/scope 查询参数；`{"counters":[{"service":"orders","rule":"retry-twice","scope":"demo","count":3}]}` |
 | POST /reset | JSON 可选 service/rule/scope，返回实际删除的计数条目数 |
 
 ```bash
 bash .agent/run.sh curl -sS -H 'Authorization: Bearer local-demo-token' http://host.docker.internal:19090/state
+bash .agent/run.sh curl -sS --get -H 'Authorization: Bearer local-demo-token' --data-urlencode 'service=orders' --data-urlencode 'scope=demo' http://host.docker.internal:19090/state
 bash .agent/run.sh curl -sS -X POST -H 'Authorization: Bearer local-demo-token' -H 'Content-Type: application/json' -d '{"service":"orders","rule":"retry-twice","scope":"demo"}' http://host.docker.internal:19090/reset
 ```
 
-`{}` 重置全部。filter 不匹配返回 `{"reset":0}`。错误 JSON、未知字段返回 400，未经认证返回 401，超过 4 KiB 的管理请求体返回 413。重置只影响之后的分配，在途请求保留已选动作。
+`/state` 的过滤条件使用 AND 精确匹配，不传参数返回全部有效计数；未知或重复参数返回 400，空值和不匹配值返回空列表，查询不会延长 TTL。scope 含空格、`&` 或其他特殊字符时使用 `--data-urlencode`。
+
+`/rules` 保留原来的 `actions` 名称数组，另提供 `sequence`：每步包含 action/repeat，以及适用的 status/seconds/delay_seconds。`match` 提供 methods/path/path_regex、header_names/query_names；匹配值以本地 YAML 为准。
+
+`{}` 重置全部。filter 不匹配返回 `{"reset":0}`；过期条目先清理，不计入 reset 数量。错误 JSON、未知字段返回 400，未经认证返回 401，超过 4 KiB 的管理请求体返回 413。重置只影响之后的分配，在途请求保留已选动作。
 
 ## 6. 排查
 
@@ -222,3 +215,14 @@ bash .agent/run.sh curl -sS -X POST -H 'Authorization: Bearer local-demo-token' 
 当前缓冲请求/响应体，上限默认为 10 MiB；不保证流式/SSE 或无限响应。HTTP/2 被禁用，以保持连接级故障可复现。当前客户端入口只验证 HTTP/1.1 明文访问；HTTPS 是指代理到后端的链路。
 
 当前不支持非空 HTTP trailers：带 trailer 的请求会立即关闭连接且不访问后端；后端响应带 trailer 则返回 502。普通 chunked 请求、chunk extension 和 100-continue 已验证。这个明确拒绝行为避免当前 mitmproxy 版本在 trailer 解析后异常并让客户端一直等待。
+
+| 现象 | 检查与处理 |
+| --- | --- |
+| runner 提示 Docker CLI 不存在或无法连接 daemon | 安装并启动 Docker/OrbStack；不要改为宿主机运行项目 |
+| 端口已占用 | 停止旧演示；修改端口时同时调整 YAML 与 runner 的发布映射 |
+| `serve` 提示缺少 token | 在 runner 的容器内设置 `admin.token_env` 指定的变量；宿主机环境变量不会自动透传 |
+| 配置通过但返回真实后端结果 | 检查服务端口、method 大小写、path、header/query 和第一条命中规则；看 `/rules` 的匹配摘要 |
+| 返回 400 且有 scenario 标记 | 检查 scope 头是否缺失、重复或过长；容量问题可按 scope reset，或等待闲置 TTL |
+| 重跑没有重新报错 | 同 scope 保留计数；换新 ID 或精确 reset；`global` 规则需要按规则重置 |
+| 容器访问宿主机后端返回 502 | 检查 upstream 是否误写容器自身 `127.0.0.1`，以及 TLS CA 和后端是否监听可达地址 |
+| `/state` 查不到计数 | 未命中规则、过滤值不符、TTL 已过期或进程重启都会导致空结果 |

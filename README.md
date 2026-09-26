@@ -7,7 +7,8 @@
 - 支持 `429 → 429 → 真实后端`、第 n 次开始失败、循环场景和固定 mock 响应。
 - 按测试请求头隔离计数，管理 API 查询状态和重置。
 - Linux Docker 中验证真实 `ECONNRESET`（errno 104），与 HTTP 504、普通断连分别测试。
-- 支持后端已执行后再返回错误或断连，验证写入重试与幂等性；附带 22 条可运行场景。
+- 支持后端已执行后再返回错误或断连，验证写入重试与幂等性；附带 30 条可运行场景。
+- 提供条件匹配、维护窗口豁免、循环恢复、缓存 304、DELETE 204 和二进制下载示例。
 
 ## 快速体验
 
@@ -29,9 +30,12 @@ bash .agent/run.sh sh -c 'for i in 1 2 3; do curl -sS -o /dev/null -w "%{http_co
 
 应依次看到 `429`、`429`、`200`。同一 ID 继续调用会正常转发；换 ID 或 reset 可从头开始。
 
+下一步可按[场景手册](docs/scenarios.md)选择用例，按测试 ID 查询状态和重置。编辑自定义 YAML 前可运行 `bash .agent/run.sh uv run fault-engine schema` 查看配置 JSON Schema；语法和重复键错误会指出行、列。runner 用法见 `bash .agent/run.sh --help`。
+
 ## 文档与验证
 
 - [使用文档](docs/usage.md)：配置完整说明、故障区别、真实后端接入、管理 API。
+- [场景手册](docs/scenarios.md)：完整场景目录、定向故障、并发隔离与重复运行步骤。
 - [开发文档](docs/development.md)：架构、生命周期、扩展、Docker/uv/ruff/ty 流程。
 - [验收记录](docs/verification.md)：需求与测试对应、验证命令和适用范围。
 - [场景示例](examples/scenarios.yaml)：可以直接使用和修改。

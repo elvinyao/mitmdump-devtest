@@ -1,13 +1,14 @@
 # 验收记录
 
-最近完整验证日期：2026-09-23。环境：Docker/OrbStack 中的 Linux、Python 3.12.14。依赖由 uv.lock 锁定，其中 mitmproxy 12.2.3、ruff 0.16.8、ty 0.0.83、pytest 9.1.1。
+最近完整验证日期：2026-09-26。环境：Docker/OrbStack 中的 Linux、Python 3.12.14。依赖由 uv.lock 锁定，其中 mitmproxy 12.2.3、ruff 0.16.8、ty 0.0.83、pytest 9.1.1。
 
 ## 结果
 
-- **195 tests passed，0 failed，0 skipped**，较首轮增加 76 项。
-- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**95%**（794 个 statement、240 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
+- **230 tests passed，0 failed，0 skipped**，较 2026-09-23 增加 35 项；本轮修改前的 195 项基线也全部通过。
+- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**95%**（813 个 statement、246 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
 - `uv lock --check`、`uv sync --locked`、`ruff format --check .`、`ruff check .`、`ty check` 全部通过。
-- `uv build` 生成 wheel 和 sdist。使用锁文件导出的生产依赖，在独立虚拟环境中离线安装 wheel；从 /tmp 导入 runtime，确认模块来自安装包。配置验证返回 `valid: 2 services, 22 rules`。
+- `uv build` 成功生成 wheel 和 sdist。当前配置验证返回 `valid: 2 services, 30 rules`。2026-09-23 另做过独立虚拟环境的离线 wheel 安装及包导入验证，本轮未重复该安装实验。
+- 完整检查通过 `sh -lc` 执行；`uv --version` 与 `uvx --version` 均为 0.12.17，验证登录 shell 重置 PATH 后仍能使用缓存工具。
 - 程序和 Docker runner 都实际运行过，测试没有用 mock 替代 mitmproxy 或 TCP reset。
 - 测试保留了 **42 条第三方弃用警告**：mitmproxy 使用 pyparsing 的旧 API，以及 ldap3 对 pyasn1 旧导出的引用。没有将这些警告隐藏或描述为零警告。
 
@@ -15,6 +16,12 @@
 
 ```bash
 bash .agent/run.sh bash .agent/check.sh
+```
+
+本轮实际命令还检查了登录 shell 的工具发现：
+
+```bash
+bash .agent/run.sh sh -lc 'uv --version && uvx --version && bash .agent/check.sh'
 ```
 
 ## 需求与证据
@@ -53,8 +60,14 @@ bash .agent/run.sh bash .agent/check.sh
 | 生命周期隔离 | test_lifecycle_review.py 验证慢管理请求、并发/取消 close、挂起后端、两阶段延迟、启动取消重试、第二 Runtime 拒绝以及排队关闭/启动所有权 |
 | 配置与状态额外边界 | test_state_review.py 验证版本类型、UTF-8 字节上限、错误值和字典 key 脱敏、保留头、YAML 别名、TTL 边界、700 请求/7 scope 和管理错误不改状态 |
 | 客户端业务场景 | test_example_catalog.py 执行示例规则：持续 401/409/503、HTML 错误、HTTP 200 业务错误、无效/空 JSON、307 保留 POST、超时→503→200 |
+| 配置编辑与发现 | test_cli.py 验证无需配置/token 的 JSON Schema、全部 10 种动作、缺失/未知 action 候选提示、YAML 行列与秘密 key/value 脱敏 |
+| 定向与恢复场景 | test_example_catalog.py 直接加载示例：方法/正则/header/query AND、重复 query 解码、scope 隔离、维护健康检查豁免、预热后循环与单 scope reset |
+| 无 body 与二进制场景 | 同一目录验证条件 GET/HEAD 304、DELETE 204、HEAD 后 GET 的二进制连接分帧、HTTP 504，与后端调用次数分别断言 |
+| 完整目录可达性 | test_every_catalog_rule_is_reachable_in_the_full_ordered_configuration 使用完整 YAML 顺序逐条选中规则，防止新增宽匹配遮蔽已有场景 |
+| 管理查询与维护 | test_maintainability.py 验证 AND 精确查询、未知/重复参数 400、未认证 401、空值不扩大选择、查询不延长 TTL、过期 reset 返回 0、规则摘要不泄露 body/header/query 值 |
+| Docker runner 体验 | test_runner.py 验证无参数/帮助/缺 Docker 提示、参数与空字符串原样转发、/workspace 挂载、loopback 发布与退出码保留；替代 Docker CLI 仅用于 runner 参数测试 |
 
-测试分布：boundaries 11、CLI 6、config 36、demo 1、engine 10、example_catalog 9、extended_scenarios 19、http_review 13、integration 36、lifecycle_review 9、network_edges 10、state_review 26、transport 9。
+测试分布：boundaries 11、CLI 12、config 36、demo 1、engine 10、example_catalog 18、extended_scenarios 19、http_review 13、integration 36、lifecycle_review 9、maintainability 14、network_edges 10、runner 6、state_review 26、transport 9。
 
 ## 实际端口映射体验
 
@@ -78,6 +91,8 @@ bash .agent/run.sh bash .agent/check.sh
 已修复并回归验证：背压关闭卡住、SO_LINGER 失败丢失映射、HEAD mock 破坏连接分帧、非法 method 未拒绝、原始 Host 无法匹配、跨字段配置错误缺少字段路径、IPv6 wildcard URL 指向错误地址。各审查项已关闭。
 
 第二轮先由 HTTP、状态/配置、生命周期三个方向独立检查并保留失败测试，再修复和自审。修复了慢管理请求拖延关闭、并发关闭异常、取消关闭泄漏、第二 Runtime 覆盖全局 context、错误消息泄露配置、文件大小按字符而非字节计算、压缩 mock 二次压缩、Latin-1 头编码、方法大小写和重复 scope 冲突。对锁定版本增加最小 trailer 拒绝适配；请求侧接受“明确关闭”作为拒绝契约，而非伪称一定返回 400。最终自审额外修复了排队启动时所有权被先前清理释放，以及 reset_after 失败的 HEAD body 泄漏，两者均有专门回归测试。
+
+2026-09-26 从配置编辑、规则发现、并行测试操作和示例复用四条路径复审。管理接口新增回归先得到 13 失败/1 通过，随后修复；全部 35 项新增测试最终通过。自审补充了首次/重跑的 scope 说明，避免按文档重复执行时跳过故障；将场景目录集中到 `docs/scenarios.md`。另做 runner/CLI 与场景文档交叉审查，提交前未发现未解决的阻塞问题。协议验证范围保持如下。
 
 ## 未覆盖的协议与环境
 

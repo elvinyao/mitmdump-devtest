@@ -121,23 +121,31 @@ class Engine:
             index -= action.repeat
         raise AssertionError("validated nonempty sequence has no selected action")
 
-    def snapshot(self) -> list[dict[str, str | int]]:
-        self._expire(self._clock())
+    def snapshot(
+        self, *, service: str | None = None, rule: str | None = None, scope: str | None = None
+    ) -> list[dict[str, str | int]]:
+        """Read live counters using the same exact selection as reset, without touching TTL."""
         return [
-            {"service": key[0], "rule": key[1], "scope": key[2], "count": counter.count}
-            for key, counter in self._counters.items()
+            {"service": key[0], "rule": key[1], "scope": key[2], "count": self._counters[key].count}
+            for key in self._matching_keys(service=service, rule=rule, scope=scope)
         ]
 
     def reset(
         self, *, service: str | None = None, rule: str | None = None, scope: str | None = None
     ) -> int:
-        keys = [
+        keys = self._matching_keys(service=service, rule=rule, scope=scope)
+        for key in keys:
+            del self._counters[key]
+        return len(keys)
+
+    def _matching_keys(
+        self, *, service: str | None, rule: str | None, scope: str | None
+    ) -> list[tuple[str, str, str]]:
+        self._expire(self._clock())
+        return [
             key
             for key in self._counters
             if (service is None or key[0] == service)
             and (rule is None or key[1] == rule)
             and (scope is None or key[2] == scope)
         ]
-        for key in keys:
-            del self._counters[key]
-        return len(keys)

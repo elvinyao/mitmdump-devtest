@@ -9,9 +9,9 @@ import signal
 import sys
 
 import yaml
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
-from fault_engine.config import Config, load_config
+from fault_engine.config import Action, Config, load_config
 
 
 def config_error_location(location: tuple[str | int, ...]) -> str:
@@ -67,10 +67,17 @@ async def serve(config: Config, token: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Deterministic mitmproxy HTTP fault scenarios")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("validate", "serve"):
-        command = subparsers.add_parser(name)
+    for name, description in (
+        ("validate", "Check configuration without starting listeners or requiring a token"),
+        ("serve", "Start proxy and admin listeners; requires the configured admin token"),
+    ):
+        command = subparsers.add_parser(name, help=description, description=description)
         command.add_argument("config", help="YAML scenario configuration")
+    subparsers.add_parser("schema", help="Print the configuration JSON Schema for editor tooling")
     args = parser.parse_args(argv)
+    if args.command == "schema":
+        print(json.dumps(Config.model_json_schema(), indent=2))
+        return 0
     try:
         config = load_config(args.config)
         if args.command == "validate":
@@ -86,13 +93,20 @@ def main(argv: list[str] | None = None) -> int:
     except ValidationError as exc:
         for error in exc.errors(include_input=False, include_context=False, include_url=False):
             location = config_error_location(error["loc"])
-            message = {
-                "union_tag_invalid": "unknown action; choose a supported action",
-                "union_tag_not_found": "action is required",
-            }.get(error["type"], error["msg"])
+            message = error["msg"]
+            if error["type"] in {"union_tag_invalid", "union_tag_not_found"}:
+                actions = ", ".join(TypeAdapter(Action).json_schema()["discriminator"]["mapping"])
+                reason = (
+                    "unknown action"
+                    if error["type"] == "union_tag_invalid"
+                    else "action is required"
+                )
+                message = f"{reason}; choose one of: {actions}"
             print(f"config {location}: {message}", file=sys.stderr)
-    except yaml.YAMLError:
-        print("config: invalid YAML syntax", file=sys.stderr)
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        print(f"config: invalid YAML syntax{location}", file=sys.stderr)
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
     return 2
