@@ -1,6 +1,6 @@
 # 验收记录
 
-最近完整验证日期：2026-09-26。环境：Docker/OrbStack 中的 Linux、Python 3.12.14。依赖由 uv.lock 锁定，其中 mitmproxy 12.2.3、ruff 0.16.8、ty 0.0.83、pytest 9.1.1。
+最近完整验证日期：2026-09-27。环境：Docker/OrbStack 中的 Linux、Python 3.12.14。依赖由 uv.lock 锁定，其中 mitmproxy 12.2.3、ruff 0.16.8、ty 0.0.83、pytest 9.1.1。
 
 ## 结果
 
@@ -25,6 +25,8 @@ bash .agent/run.sh sh -lc 'uv run --no-sync ruff format . && bash .agent/check.s
 bash .agent/run.sh uv run --no-sync pytest tests/test_regex_safety.py -q
 bash .agent/run.sh bash .agent/check-wheel.sh
 ```
+
+2026-09-27 继续复核不可变计划、分页、资源配额、启动回滚和协议适配的实现及回归测试，重新执行 `bash .agent/run.sh bash .agent/check.sh`：304 项全部通过，覆盖率 96%，构建及独立 wheel 检查通过，未发现新的阻塞项。
 
 ## 需求与证据
 
