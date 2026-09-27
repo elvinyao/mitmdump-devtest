@@ -16,14 +16,19 @@
 
 Runtime 现在在构造 Master 前拒绝第二个活跃实例。生命周期锁串行化启动和清理，并发 close 共享受 shield 保护的清理任务；取消 close 的调用者不会取消后台清理。管理请求关闭宽限为 0.2 秒，未完成的请求体不能让关闭等待默认的 60 秒。启动取消或失败后释放监听器和进程占用，可重新启动。API 应在同一 asyncio event loop 内使用。
 
+启动失败回滚也通过独立 `_cleanup_task` 执行。重复取消 start 的调用者时，后台仍继续回收资源，后续 close 加入同一个清理任务。失败资源引用和 Runtime 所有权会保留，显式 close 可重试；所有清理成功后才恢复协议适配并释放所有权。启动异常保留为主异常，回滚失败通过异常链和日志报告。
+
 ## 源文件职责
 
 | 文件 | 职责 |
 | --- | --- |
 | config.py | strict pydantic 配置、YAML 重复 key 检查、响应编码与交叉引用 |
+| matching.py | 有长度限制的 Rust regex 完整匹配、语法错误脱敏 |
+| plan.py | 将输入模型编译为只读规则、服务和动作快照，预编码响应与累计 repeat |
 | engine.py | 匹配、序号分配、重复/循环选择、TTL/容量、查询与重置 |
 | addon.py | mitmproxy HTTP hooks、异步延迟、mock、故障事件 |
 | transport.py | 不解析 HTTP 的 TCP 字节中继、地址映射、SO_LINGER RST |
+| limits.py | 单事件循环内的共享连接/请求配额与幂等释放凭据 |
 | admin.py | 独立 aiohttp 管理 API、鉴权、输入大小和 reset 校验 |
 | runtime.py | 组装、启动、异常回滚和关闭 |
 | http1_compat.py | 活跃 Runtime 期间安装并在关闭后恢复的 trailer 拒绝适配 |
@@ -33,11 +38,19 @@ Runtime 现在在构造 Master 前拒绝第二个活跃实例。生命周期锁�
 
 `Engine.decide()` 没有 await；同一 asyncio event loop 内匹配和递增为一个同步步骤。不要从其他线程调用 Engine，也不要在计数分配前插入 await。异步动作只在 Decision 已生成后执行。Decision 为冻结 dataclass，运行期间不修改配置。
 
-状态键为 `(service, rule, scope)`。OrderedDict 按最后命中排序，先移除过期键，再检查容量；不会为新 scope 静默踢掉活跃场景。reset 删除计数，不修改已经选中的 Decision。尚未命中规则的请求不占用状态容量。
+状态键为 `(service, rule, scope)`。OrderedDict 按最后命中排序，先批量移除过期键，再检查容量；不会为新 scope 静默踢掉活跃场景。每批至多清理 1000 条并汇总日志，避免大量过期状态使一次普通请求处理全部清理。当前命中 scope 若位于尚未清理的过期区间，仍另行删除并从 1 开始。reset 删除计数，不修改已经选中的 Decision。尚未命中规则的请求不占用状态容量。
 
-`snapshot()` 与 `reset()` 共用 `_matching_keys()`，先清理过期条目再执行 service/rule/scope 的 AND 精确过滤；读取不会刷新最后命中时间。管理 `/state` 拒绝未知或重复 query 参数，避免拼写错误被当成无过滤查询。`/rules` 通过字段允许列表输出动作摘要；新增动作时显式决定哪些参数可公开，不要直接序列化完整规则。
+`snapshot()` 与 `reset()` 共用 `_matching_keys()`，跳过所有已过期条目再执行 service/rule/scope 的 AND 精确过滤；读取不会刷新最后命中时间。管理 `/state` 使用 `snapshot_page()`，按独立的条目创建 ID 分页，避免命中顺序变化造成重复。游标绑定实例、过滤条件和本轮 ID 上界；扫描与输出都有上限，可出现带后续游标的空页。游标不是事务快照，reset/TTL 会使条目消失。管理接口拒绝未知或重复 query 参数。`/rules` 通过字段允许列表输出动作摘要；新增动作时显式决定哪些参数可公开，不要直接序列化完整规则。
 
-规则与动作 pydantic 对象禁止字段赋值，但其 list/dict 不作深层冻结；它们是启动后只读的内部数据，不提供热修改 API。扩展时如引入动态配置，应增加不可变快照及版本化状态迁移，不要直接修改列表。
+输入 Config 仍采用便于 YAML/JSON 验证的 Pydantic 模型，其 list/dict 可变；Runtime 创建时通过 `compile_plan()` 生成独立 ExecutionPlan。Plan 使用冻结 dataclass、tuple、只读映射和 bytes，Engine、Addon、Admin 共享同一个对象。响应 body/header 只编码一次，动作重复次数预计算为累计区间，通过二分选择。外部修改输入配置不会改变在途或后续请求；没有配置热替换 API。以后增加热加载时，需要明确计划版本与计数迁移策略。
+
+`path_regex` 用 Pydantic Core 的 Rust regex 显式编译，禁止回退到 Python re。先验证原表达式，再加完整路径锚点，避免不平衡分组逃出包装。原模式限制 4096 字符；不支持环视和反向引用。反例回归放在有外层超时的独立子进程中，防止意外恢复回溯实现时挂住整套测试。
+
+## 资源配额
+
+每个 Runtime 只创建一个 ResourceBudget，所有 TCPBridge 与 FaultAddon 共享。连接接受时取得连接凭据，结束时幂等释放；超过上限即关闭。请求从 requestheaders 开始占位，覆盖请求体、上游等待和各阶段延迟，响应 hook 完成、错误、客户端断开或关闭时归还。管理监听器不消耗数据面配额。
+
+mitmproxy 在 requestheaders 设置 response 后仍可能缓冲 body，故首个请求的容量拒绝由 Addon 构造少量 HTTP 字节，交给 Bridge 在停止中继后有界发送；Bridge 不解析 HTTP。公开 writer 及凭据始终由原中继任务持有，拒绝调用方取消不会丢失清理。发送超时后立即 abort。复用/管道连接可能仍有上一响应未转发完，超限只能关闭，不能注入新的 503。新增 hook 或动作时必须检查取得/归还凭据的路径，不得在拒绝后调用 Engine 分配序号。
 
 ## RST 与关闭
 
@@ -61,11 +74,13 @@ bash .agent/run.sh uv run ty check
 bash .agent/run.sh bash .agent/check.sh
 ```
 
-Python 固定 3.12，mitmproxy 限定 12 系列并由 uv.lock 固定实际版本。runner 引导 uv 0.12.17。`.venv-docker` 不能在 macOS 宿主机运行。ruff/ty 排除该第三方虚拟环境，ty 检查 src、tests 和 examples。
+Python 固定 3.12，包元数据和锁文件共同约束 mitmproxy==12.2.3、h11==0.16.0；Pydantic Core 的公开 schema API 也显式列为依赖。runner 引导 uv 0.12.17。`.venv-docker` 不能在 macOS 宿主机运行。ruff/ty 排除该第三方虚拟环境，ty 检查 src、tests 和 examples。
 
 runner 的 `--help` 与缺少命令提示无需 Docker；实际执行仍全部经 Docker。容器入口将缓存中的 uv/uvx 链接到 `/usr/local/bin`，保证 `sh -lc` 重置 PATH 后仍能找到工具。`tests/test_runner.py` 在容器内用替代 Docker CLI 验证参数原样传递、发布地址、工作目录和失败退出码，不启动嵌套容器。
 
 `fault-engine schema` 直接从 Pydantic 模型输出 JSON Schema，不另存一份需要同步的静态定义。YAML 错误只输出行列；字段错误只保留已知 schema 路径，禁止回显配置值或自定义字典 key。
+
+完整 check 在构建后调用 `.agent/check-wheel.sh`：将锁定生产依赖导出为版本约束，仅以实际 wheel 为安装目标，离线安装到临时虚拟环境，从仓库外执行 schema、HTTP mock 及双向 trailer 拒绝检查。所需依赖由 wheel 元数据决定，缓存由前面的 `uv sync --locked` 准备。这样验证安装包的依赖声明和导入路径，而不只验证 editable 源码环境。
 
 依赖升级使用 `bash .agent/run.sh uv lock --upgrade-package <package>`，随后执行完整 check。runner 的多个容器共享虚拟环境；不要并发修改依赖或格式化同一文件。无需 sudo 在宿主机安装工具。
 
@@ -82,8 +97,12 @@ runner 的 `--help` 与缺少命令提示无需 Docker；实际执行仍全部�
 - lifecycle_review 覆盖并发关闭、调用者取消、慢管理请求、启动回滚和进程全局状态隔离。
 - state_review 覆盖错误脱敏、配置字节边界、保留 scope 头、多 scope 并发与 TTL；example_catalog 实际执行仓库中的示例规则。
 - maintainability 覆盖管理过滤、摘要脱敏和过期 reset；example_catalog 还验证完整规则目录的可达性，避免宽泛规则遮蔽其他例子。
+- regex_safety/execution_plan 覆盖非回溯匹配、语法边界、深层只读快照、累计序列、分页和过期积压；architecture_integration 覆盖真实在途响应与 Admin 使用相同 Plan。
+- runtime_rollback/dependency_compat 覆盖重复取消、清理失败重试、依赖版本/API 边界及适配器安装恢复；resource_limits 覆盖慢上传、跨服务配额、拒绝发送超时、复用连接和释放路径。
 
-`http1_compat.py` 有意适配 mitmproxy 12.2.3 的私有 HTTP/1 reader 工厂：h11 解析出非空 trailer 时转为协议错误，避免依赖内部抛出未处理的 NotImplementedError。没有复制整套 HTTP parser，也不静默丢弃 trailer。依赖升级必须重跑请求和响应两个方向的真实字节测试；上游原生处理修复后应移除此适配。请求侧原生错误路径会先关连接，不能承诺返回 400；响应侧为 502。
+测试后端直接监听端口 0；需要先写入 Config 的端口由 `free_port()` 保证同一测试进程内不重复分配，避免服务/admin 尚未绑定时得到同一端口。该辅助函数不提供跨进程保留保证；监听器测试应在隔离的 runner 网络中执行。
+
+`http1_compat.py` 有意适配 mitmproxy 12.2.3 的私有 HTTP/1 reader 工厂：h11 解析出非空 trailer 时转为协议错误，避免依赖内部抛出未处理的 NotImplementedError。安装前检查依赖版本、工厂签名与 reader 能力，拒绝覆盖其他适配器。没有复制整套 HTTP parser，也不静默丢弃 trailer。依赖升级需要同步包元数据、支持版本表和锁文件，并重跑源码与已安装 wheel 的双向 trailer 测试；上游原生处理修复后应移除此适配。请求侧原生错误路径会先关连接，不能承诺返回 400；响应侧为 502。
 
 采用 superpowers 的设计审批、TDD、根因排查、独立审查和完成前验证。先复现缺失行为或缺陷，再改实现。不要把网络异常全部放宽为“任何 exception”来让测试通过；reset 的原始 socket 断言必须保留。
 

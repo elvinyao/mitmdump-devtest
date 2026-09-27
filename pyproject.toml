@@ -3,7 +3,14 @@ name = "fault-engine"
 version = "0.1.0"
 description = "Deterministic mitmproxy reverse-proxy fault scenarios"
 requires-python = ">=3.12,<3.13"
-dependencies = ["mitmproxy>=12,<13", "pydantic>=2.11,<3", "PyYAML>=6,<7", "aiohttp>=3.12,<4"]
+dependencies = [
+    "mitmproxy==12.2.3",
+    "h11==0.16.0",
+    "pydantic>=2.11,<3",
+    "pydantic-core>=2.33,<3",
+    "PyYAML>=6,<7",
+    "aiohttp>=3.12,<4",
+]
 
 [project.scripts]
 fault-engine = "fault_engine.cli:main"

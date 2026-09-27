@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from fault_engine.config import Config, Model
 from fault_engine.engine import Engine
+from fault_engine.plan import ActionPlan, ExecutionPlan
 
 
 class CounterSelection(Model):
@@ -17,7 +18,18 @@ class CounterSelection(Model):
     scope: str | None = None
 
 
-def make_admin(config: Config, engine: Engine, token: str) -> web.Application:
+def _action_summary(action: ActionPlan) -> dict[str, str | int | float]:
+    summary: dict[str, str | int | float] = {"action": action.action, "repeat": action.repeat}
+    if action.status is not None:
+        summary.update(status=action.status, delay_seconds=action.delay_seconds)
+    if action.seconds is not None:
+        summary["seconds"] = action.seconds
+    return summary
+
+
+def make_admin(config: Config | ExecutionPlan, engine: Engine, token: str) -> web.Application:
+    plan = engine.config
+
     @web.middleware
     async def auth(
         request: web.Request, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]
@@ -35,19 +47,34 @@ def make_admin(config: Config, engine: Engine, token: str) -> web.Application:
         try:
             if len(request.query) != len(set(request.query)):
                 raise ValueError("duplicate query parameter")
-            selection = CounterSelection.model_validate(dict(request.query))
+            query = dict(request.query)
+            raw_limit = query.pop("limit", str(plan.limits.state_page_size))
+            if not raw_limit.isascii() or not raw_limit.isdecimal():
+                raise ValueError("invalid limit")
+            limit = int(raw_limit)
+            if not 1 <= limit <= plan.limits.state_page_size:
+                raise ValueError("limit out of range")
+            cursor = query.pop("cursor", None)
+            selection = CounterSelection.model_validate(query)
+            counters, next_cursor = engine.snapshot_page(
+                service=selection.service,
+                rule=selection.rule,
+                scope=selection.scope,
+                limit=limit,
+                cursor=cursor,
+            )
         except ValueError:
             return web.json_response(
-                {"error": "expected optional service, rule, scope query parameters, once each"},
+                {
+                    "error": "expected valid service, rule, scope, limit, cursor parameters, "
+                    "once each"
+                },
                 status=400,
             )
-        return web.json_response(
-            {
-                "counters": engine.snapshot(
-                    service=selection.service, rule=selection.rule, scope=selection.scope
-                )
-            }
-        )
+        result: dict[str, object] = {"counters": counters}
+        if next_cursor is not None:
+            result["next_cursor"] = next_cursor
+        return web.json_response(result)
 
     async def rules(request: web.Request) -> web.Response:
         return web.json_response(
@@ -69,14 +96,9 @@ def make_admin(config: Config, engine: Engine, token: str) -> web.Application:
                         },
                         # An allowlist keeps response bodies and header/query values
                         # private even when future action models gain fields.
-                        "sequence": [
-                            a.model_dump(
-                                include={"action", "repeat", "status", "seconds", "delay_seconds"}
-                            )
-                            for a in r.sequence
-                        ],
+                        "sequence": [_action_summary(a) for a in r.sequence],
                     }
-                    for r in config.rules
+                    for r in plan.rules
                 ]
             }
         )

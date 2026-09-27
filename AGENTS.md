@@ -4,7 +4,7 @@
 
 Fault Engine is a mitmproxy-based reverse proxy for development fault testing.
 
-- `src/fault_engine/`: configuration (`config.py`), decisions (`engine.py`), HTTP hooks (`addon.py`), TCP transport (`transport.py`), runtime, admin API, and CLI.
+- `src/fault_engine/`: configuration (`config.py`), immutable plans (`plan.py`), decisions (`engine.py`), HTTP hooks (`addon.py`), TCP transport (`transport.py`), resource limits, runtime, admin API, and CLI.
 - `tests/`: unit, integration, socket, and CLI tests; shared fixtures in `conftest.py`.
 - `examples/`: runnable `demo.py` and the YAML scenario catalog.
 - `docs/`: usage, architecture, and verification records.
@@ -22,7 +22,7 @@ The runner uses `python:3.12-bookworm` and mounts the repository at `/workspace`
 - `bash .agent/run.sh --publish uv run python examples/demo.py`: start backends and proxy; host ports are 18080, 18081, and admin 19090.
 - `bash .agent/run.sh uv run pytest tests/test_engine.py -q`: run focused tests.
 - `bash .agent/run.sh uv run ruff format .`: format Python files.
-- `bash .agent/run.sh bash .agent/check.sh`: verify lockfile, formatting, Ruff lint, ty types, pytest coverage, and wheel/sdist builds.
+- `bash .agent/run.sh bash .agent/check.sh`: verify lockfile, formatting, Ruff lint, ty types, pytest coverage, builds, and isolated wheel smoke tests.
 
 ## Coding Style & Naming Conventions
 

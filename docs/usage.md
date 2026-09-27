@@ -63,6 +63,10 @@ admin:
 state:
   capacity: 10000
   ttl_seconds: 3600
+limits:
+  max_connections: 256
+  max_inflight_requests: 128
+  state_page_size: 1000
 body_limit: 10485760
 rules:
   - id: retry-payment
@@ -90,12 +94,28 @@ HTTPS upstream 默认验证证书，系统信任根可直接使用；私有 CA �
 
 配置不热加载；修改后重启。文件使用 UTF-8，最大 1 MiB（按字节计）。未知字段、重复 YAML key、无效引用和不合法的动作组合会在启动前拒绝。version 只接受整数 1。
 
+创建 Runtime 时，配置会编译成独立的只读执行计划。嵌入调用方之后修改原始 Config 的列表或字典，不会改变正在执行的请求、后续规则或管理接口；应用新配置需要创建新的运行实例。
+
+### 资源限额
+
+| 字段 | 默认值 | 行为 |
+| --- | --- | --- |
+| `limits.max_connections` | 256 | 所有服务共享的公开 TCP 连接上限，包含空闲 keepalive；超限连接立即关闭 |
+| `limits.max_inflight_requests` | 128 | 从收到请求头开始，覆盖上传、上游响应缓冲和故障延迟，直到响应 hook 完成或请求终止 |
+| `limits.state_page_size` | 1000 | `/state` 默认及最大单页条数，查询可通过 limit 选择更小的页 |
+
+均为正整数；连接/请求上限最大 100000，单页最大 10000。管理监听器独立于上述数据面配额，因此代理繁忙时仍可查询和重置。`state.capacity` 限制计数条目，`body_limit` 限制单条请求/响应大小；它们与连接及在途请求限额分别生效。
+
+在途请求超限时，新连接的首个请求无需上传完整 body 就收到 **503 + `X-Fault-Engine-Error: capacity` + `Connection: close`**；HEAD 不返回错误 body。已经处理过请求的 keepalive/管道连接会直接关闭并记录 `capacity_exhausted`，避免把 503 拼进上一条未发送完的响应。被拒请求不访问后端、不消耗场景序号。
+
+拒绝响应的发送最多等待 0.5 秒；客户端不读或发生 I/O 故障时直接关闭，不能保证收到完整 503。正常关闭、取消、reset、断连都会归还配额。配额不代表所有缓冲区的精确内存总量限制，慢客户端仍会占用连接配额。
+
 ## 3. 匹配和计数
 
 - 规则按配置顺序匹配，**第一条命中生效**，不叠加其他规则；未命中透传且不计数。
 - `match` 的字段为 AND 关系。省略 match 表示匹配服务的全部普通 HTTP 请求。
 - `methods` 是区分大小写的 HTTP method 列表；省略即全部方法。CONNECT 隧道不支持，非法 method 拒绝。
-- `path` 精确匹配原始路径，不含 query，不额外 URL 解码。与 `path_regex` 互斥；正则使用 fullmatch，匹配整个路径。
+- `path` 精确匹配原始路径，不含 query，不额外 URL 解码。与 `path_regex` 互斥；正则匹配整个路径。
 - header 名称大小写不敏感，值精确匹配；匹配看到的是客户端原始 Host。重复普通 header 按 mitmproxy 的合并值匹配。
 - query 名称/值经过 URL 解码，重复 key 中只要有一个值满足配置即可。
 - `scope: global` 是默认值，所有匹配该规则的请求共享计数。其他值代表请求头名，例如 `X-Test-Run-ID`。
@@ -105,6 +125,8 @@ HTTPS upstream 默认验证证书，系统信任根可直接使用；私有 CA �
 - 所有配置中的 scope 控制头默认在转发前删除，包括未匹配请求。禁止使用 Authorization/Cookie/Host 等保留头作为 scope。
 
 序号从 1 开始，先分配再执行延迟。并发请求按进入引擎的顺序分配，不保证按响应完成顺序递增。请求取消仍消耗已分配序号。
+
+`path_regex` 最长 4096 字符，使用非回溯的 Rust regex 引擎；环视、反向引用及不兼容语法在 `validate` 时拒绝，错误信息不会回显表达式。原来依赖这些 Python `re` 特性的配置需要改写；路径、方法、header/query 组合通常可以表达相同的测试条件。引擎仍按同步步骤分配计数，不把危险匹配丢入无法取消的后台线程。语法依据见 [Pydantic regex engine](https://pydantic.dev/docs/validation/latest/api/pydantic/config/#regex_engine)。
 
 `start_at: 5` 与一个 `repeat: 2` 的 503 步骤表示：1–4 次透传，5–6 次 503，随后执行结束策略。`repeat` 是该步骤占据的请求数，不是在代理内部重试。
 
@@ -191,7 +213,7 @@ bash .agent/run.sh curl -v http://host.docker.internal:18080/reset
 | --- | --- |
 | GET /health | `{"status":"ok"}` |
 | GET /rules | 规则 ID、服务、scope、起始序号、匹配摘要和动作参数，不暴露 mock body 或 header/query 值 |
-| GET /state | 可选 service/rule/scope 查询参数；`{"counters":[{"service":"orders","rule":"retry-twice","scope":"demo","count":3}]}` |
+| GET /state | 可选 service/rule/scope、limit/cursor；响应包含 counters，有后续页时另含 next_cursor |
 | POST /reset | JSON 可选 service/rule/scope，返回实际删除的计数条目数 |
 
 ```bash
@@ -200,11 +222,20 @@ bash .agent/run.sh curl -sS --get -H 'Authorization: Bearer local-demo-token' --
 bash .agent/run.sh curl -sS -X POST -H 'Authorization: Bearer local-demo-token' -H 'Content-Type: application/json' -d '{"service":"orders","rule":"retry-twice","scope":"demo"}' http://host.docker.internal:19090/reset
 ```
 
-`/state` 的过滤条件使用 AND 精确匹配，不传参数返回全部有效计数；未知或重复参数返回 400，空值和不匹配值返回空列表，查询不会延长 TTL。scope 含空格、`&` 或其他特殊字符时使用 `--data-urlencode`。
+`/state` 的过滤条件使用 AND 精确匹配，不传参数返回第一页有效计数；未知或重复参数返回 400，空过滤值不会扩大选择，查询不会延长 TTL。scope 含空格、`&` 或其他特殊字符时使用 `--data-urlencode`。
+
+`limit` 必须为 1 到 `limits.state_page_size` 的十进制整数，省略时使用上限。响应没有 `next_cursor` 就是最后一页；有该字段时，将它原样作为下一次查询的 `cursor`，保持 service/rule/scope 不变。分页按条目创建顺序，不因后续命中而移动；游标绑定当前 Engine 实例和过滤条件，重启后失效。查询不是事务快照：首次查询之后创建或重建的计数条目不进入本轮，已有计数会更新，已 reset/过期条目会消失。
+
+每页扫描量也有上限，因此即使 counters 为空，只要仍有 next_cursor 就应继续。旧客户端若只读取一次 `/state`，需要改为持续翻页；默认 1000 条以内且无需继续扫描的结果仍只有 counters 字段。
+
+```bash
+bash .agent/run.sh curl -sS --get -H 'Authorization: Bearer local-demo-token' --data-urlencode 'service=orders' --data-urlencode 'limit=100' http://host.docker.internal:19090/state
+# 有下一页时，保留上面的过滤条件并添加 --data-urlencode 'cursor=响应中的next_cursor'
+```
 
 `/rules` 保留原来的 `actions` 名称数组，另提供 `sequence`：每步包含 action/repeat，以及适用的 status/seconds/delay_seconds。`match` 提供 methods/path/path_regex、header_names/query_names；匹配值以本地 YAML 为准。
 
-`{}` 重置全部。filter 不匹配返回 `{"reset":0}`；过期条目先清理，不计入 reset 数量。错误 JSON、未知字段返回 400，未经认证返回 401，超过 4 KiB 的管理请求体返回 413。重置只影响之后的分配，在途请求保留已选动作。
+`{}` 重置全部。filter 不匹配返回 `{"reset":0}`；过期条目不计入 reset 数量，其物理删除分批进行。错误 JSON、未知字段返回 400，未经认证返回 401，超过 4 KiB 的管理请求体返回 413。重置只影响之后的分配，在途请求保留已选动作。
 
 ## 6. 排查
 
@@ -223,6 +254,8 @@ bash .agent/run.sh curl -sS -X POST -H 'Authorization: Bearer local-demo-token' 
 | `serve` 提示缺少 token | 在 runner 的容器内设置 `admin.token_env` 指定的变量；宿主机环境变量不会自动透传 |
 | 配置通过但返回真实后端结果 | 检查服务端口、method 大小写、path、header/query 和第一条命中规则；看 `/rules` 的匹配摘要 |
 | 返回 400 且有 scenario 标记 | 检查 scope 头是否缺失、重复或过长；容量问题可按 scope reset，或等待闲置 TTL |
+| 返回 503 且有 capacity 标记，或新连接立即关闭 | 检查连接/在途请求限额、过长延迟和未关闭的 keepalive；减少并发或调整 limits |
 | 重跑没有重新报错 | 同 scope 保留计数；换新 ID 或精确 reset；`global` 规则需要按规则重置 |
 | 容器访问宿主机后端返回 502 | 检查 upstream 是否误写容器自身 `127.0.0.1`，以及 TLS CA 和后端是否监听可达地址 |
 | `/state` 查不到计数 | 未命中规则、过滤值不符、TTL 已过期或进程重启都会导致空结果 |
+| `/state` 第一页不含目标 scope | 有 next_cursor 时继续翻页；即使该页 counters 为空也不要提前结束 |

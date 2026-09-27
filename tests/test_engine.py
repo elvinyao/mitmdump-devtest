@@ -7,7 +7,7 @@ from fault_engine.config import Config
 from fault_engine.engine import Engine, ScenarioError
 
 
-def make_engine(rule=None, state=None, clock=None):
+def make_config(rule=None, state=None):
     scenario = {
         "id": "r",
         "service": "s",
@@ -22,7 +22,11 @@ def make_engine(rule=None, state=None, clock=None):
     }
     if state:
         data["state"] = state
-    return Engine(Config.model_validate(data), **({"clock": clock} if clock else {}))
+    return Config.model_validate(data)
+
+
+def make_engine(rule=None, state=None, clock=None):
+    return Engine(make_config(rule, state), **({"clock": clock} if clock else {}))
 
 
 def decide(engine, headers=None, method="GET", path="/", query=None):
@@ -65,7 +69,7 @@ def test_end_policy(policy, expected):
 
 
 def test_match_all_fields_first_match_and_nonmatching_does_not_count():
-    engine = make_engine(
+    config = make_config(
         {
             "match": {
                 "methods": ["POST", "PUT"],
@@ -75,6 +79,7 @@ def test_match_all_fields_first_match_and_nonmatching_does_not_count():
             }
         }
     )
+    engine = Engine(config)
     assert decide(engine) is None
     assert decide(engine, {"X-Client": "mobile"}, "POST", "/orders/1/extra", [("tag", "b")]) is None
     assert decide(engine, {"X-Client": "mobile"}, "POST", "/orders/1", [("tag", "a")]) is None
@@ -82,9 +87,9 @@ def test_match_all_fields_first_match_and_nonmatching_does_not_count():
         engine, {"X-CLIENT": "mobile"}, "PUT", "/orders/12", [("tag", "a"), ("tag", "b")]
     )
     assert decision.ordinal == 1
-    config = engine.config.model_dump(exclude_unset=True)
-    config["rules"].append({"id": "other", "service": "s", "sequence": [{"action": "reset"}]})
-    other = Engine(Config.model_validate(config))
+    data = config.model_dump(exclude_unset=True)
+    data["rules"].append({"id": "other", "service": "s", "sequence": [{"action": "reset"}]})
+    other = Engine(Config.model_validate(data))
     assert decide(other, {"X-Client": "mobile"}, "POST", "/orders/1", [("tag", "b")]).rule_id == "r"
     assert decide(other).rule_id == "other"
 

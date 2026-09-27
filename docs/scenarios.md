@@ -97,3 +97,5 @@ bash .agent/run.sh curl -sS -i http://host.docker.internal:18080/maintenance/ord
 - TTL 是自最后一次命中起的闲置时间，设得比完整重试测试更长；过期或重启都会清空计数。
 - 容量满时新 scope 得到 scenario 400，活跃 scope 不会被静默淘汰。先清理已结束的测试，或按需求调整 capacity。
 - 用 `/rules` 检查匹配摘要和动作次数，用过滤后的 `/state` 检查实际序号；reset 不改变已经开始的请求。
+- `/state` 有 `next_cursor` 时继续翻页，直到该字段消失；空页也可能有后续游标。
+- 新连接首个请求出现 `503 + capacity`，或复用连接被关闭并记录 `capacity_exhausted`，表示资源限额触发而非场景故障；降低并发/缩短延迟，或调整 `limits`。被拒请求不占场景序号。

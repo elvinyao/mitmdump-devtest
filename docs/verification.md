@@ -4,11 +4,11 @@
 
 ## 结果
 
-- **230 tests passed，0 failed，0 skipped**，较 2026-09-23 增加 35 项；本轮修改前的 195 项基线也全部通过。
-- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**95%**（813 个 statement、246 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
+- **304 tests passed，0 failed，0 skipped**，在上一轮 230 项基础上增加 74 项架构与边界回归。
+- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**96%**（1196 个 statement、344 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
 - `uv lock --check`、`uv sync --locked`、`ruff format --check .`、`ruff check .`、`ty check` 全部通过。
-- `uv build` 成功生成 wheel 和 sdist。当前配置验证返回 `valid: 2 services, 30 rules`。2026-09-23 另做过独立虚拟环境的离线 wheel 安装及包导入验证，本轮未重复该安装实验。
-- 完整检查通过 `sh -lc` 执行；`uv --version` 与 `uvx --version` 均为 0.12.17，验证登录 shell 重置 PATH 后仍能使用缓存工具。
+- `uv build` 成功生成 wheel 和 sdist。独立虚拟环境离线安装 wheel，确认从安装路径导入，schema、HTTP mock 及请求/响应 trailer 拒绝检查通过。生产锁文件作为版本约束，依赖由 wheel 元数据决定。配置验证返回 `valid: 2 services, 30 rules`。
+- 完整检查通过 `sh -lc` 执行。上一轮已验证登录 shell 的 `uv` 与 `uvx` 均为 0.12.17，本轮沿用同一工具链。
 - 程序和 Docker runner 都实际运行过，测试没有用 mock 替代 mitmproxy 或 TCP reset。
 - 测试保留了 **42 条第三方弃用警告**：mitmproxy 使用 pyparsing 的旧 API，以及 ldap3 对 pyasn1 旧导出的引用。没有将这些警告隐藏或描述为零警告。
 
@@ -18,10 +18,12 @@
 bash .agent/run.sh bash .agent/check.sh
 ```
 
-本轮实际命令还检查了登录 shell 的工具发现：
+本轮实际运行完整检查，并在末次审查加强 Engine 正则回归与 wheel 依赖检查后分别复验：
 
 ```bash
-bash .agent/run.sh sh -lc 'uv --version && uvx --version && bash .agent/check.sh'
+bash .agent/run.sh sh -lc 'uv run --no-sync ruff format . && bash .agent/check.sh'
+bash .agent/run.sh uv run --no-sync pytest tests/test_regex_safety.py -q
+bash .agent/run.sh bash .agent/check-wheel.sh
 ```
 
 ## 需求与证据
@@ -66,8 +68,15 @@ bash .agent/run.sh sh -lc 'uv --version && uvx --version && bash .agent/check.sh
 | 完整目录可达性 | test_every_catalog_rule_is_reachable_in_the_full_ordered_configuration 使用完整 YAML 顺序逐条选中规则，防止新增宽匹配遮蔽已有场景 |
 | 管理查询与维护 | test_maintainability.py 验证 AND 精确查询、未知/重复参数 400、未认证 401、空值不扩大选择、查询不延长 TTL、过期 reset 返回 0、规则摘要不泄露 body/header/query 值 |
 | Docker runner 体验 | test_runner.py 验证无参数/帮助/缺 Docker 提示、参数与空字符串原样转发、/workspace 挂载、loopback 发布与退出码保留；替代 Docker CLI 仅用于 runner 参数测试 |
+| 正则计算边界 | test_regex_safety.py 使用带外层超时的子进程，将嵌套重复表达式与 10000 字符近似匹配送入 Engine；验证完整路径、分支、inline flags、长度和不兼容语法拒绝 |
+| 不可变执行计划 | test_execution_plan.py 与 test_architecture_integration.py 验证源配置列表/字典变更不影响匹配、已分配动作、实际延迟响应、后续路由或管理目录；响应只编码一次 |
+| 启动回滚与失败重试 | test_runtime_rollback.py 验证重复取消仍后台清理、并发 close 加入回滚、失败保留资源/进程所有权、保留原始启动异常且可重试清理 |
+| 依赖兼容与安装包 | test_dependency_compat.py 验证版本、reader 能力、外部适配器保护、安装恢复幂等；check-wheel.sh 从已安装 wheel 验证 CLI 和双向协议适配 |
+| 连接/在途资源限额 | test_resource_limits.py 验证跨服务共享预算、慢上传先占位、首请求 POST/HEAD 容量拒绝、延迟期间不提前释放、RST 客户端互不影响及首步前取消 |
+| 拒绝响应的协议与释放 | 同一文件验证输出阻塞最多等待 0.5 秒后释放；已成功响应 4 MiB 数据后的管道请求若超限，只关闭连接而不把 503 插入上一响应 |
+| 有界管理分页与过期清理 | test_execution_plan.py 与 test_resource_limits.py 验证过滤绑定游标、创建顺序、固定 ID 上界、空页继续、历史 reset 空洞、过期积压和当前 scope 重启 |
 
-测试分布：boundaries 11、CLI 12、config 36、demo 1、engine 10、example_catalog 18、extended_scenarios 19、http_review 13、integration 36、lifecycle_review 9、maintainability 14、network_edges 10、runner 6、state_review 26、transport 9。
+测试分布：architecture_integration 1、boundaries 11、CLI 12、config 36、demo 1、dependency_compat 5、engine 10、example_catalog 18、execution_plan 23、extended_scenarios 19、http_review 13、integration 36、lifecycle_review 9、maintainability 14、network_edges 10、regex_safety 17、resource_limits 24、runner 6、runtime_rollback 4、state_review 26、transport 9。
 
 ## 实际端口映射体验
 
@@ -92,7 +101,11 @@ bash .agent/run.sh sh -lc 'uv --version && uvx --version && bash .agent/check.sh
 
 第二轮先由 HTTP、状态/配置、生命周期三个方向独立检查并保留失败测试，再修复和自审。修复了慢管理请求拖延关闭、并发关闭异常、取消关闭泄漏、第二 Runtime 覆盖全局 context、错误消息泄露配置、文件大小按字符而非字节计算、压缩 mock 二次压缩、Latin-1 头编码、方法大小写和重复 scope 冲突。对锁定版本增加最小 trailer 拒绝适配；请求侧接受“明确关闭”作为拒绝契约，而非伪称一定返回 400。最终自审额外修复了排队启动时所有权被先前清理释放，以及 reset_after 失败的 HEAD body 泄漏，两者均有专门回归测试。
 
-2026-09-26 从配置编辑、规则发现、并行测试操作和示例复用四条路径复审。管理接口新增回归先得到 13 失败/1 通过，随后修复；全部 35 项新增测试最终通过。自审补充了首次/重跑的 scope 说明，避免按文档重复执行时跳过故障；将场景目录集中到 `docs/scenarios.md`。另做 runner/CLI 与场景文档交叉审查，提交前未发现未解决的阻塞问题。协议验证范围保持如下。
+2026-09-26 第一轮从配置编辑、规则发现、并行测试操作和示例复用四条路径复审。管理接口新增回归先得到 13 失败/1 通过，随后修复；全部 35 项新增测试最终通过。自审补充了首次/重跑的 scope 说明，避免按文档重复执行时跳过故障；将场景目录集中到 `docs/scenarios.md`。另做 runner/CLI 与场景文档交叉审查。
+
+随后架构审查复现了正则阻塞和启动回滚双重取消的监听器泄漏，落实非回溯匹配、受取消保护的回滚、兼容版本边界、只读计划和资源限额。交叉审查修复了拒绝响应超时后再次无限等待、历史状态 ID 空洞导致首屏不可用，以及复用连接直接注入 503 可能损坏前一响应的问题。新增失败测试分别验证了修复；实际测试还暴露端口辅助函数可重复选中同一端口，现已避免进程内重复分配，测试后端改为直接监听端口 0。
+
+行为变更已写入使用文档：不兼容的 Python 正则语法会在启动前拒绝；超过单页上限的状态需要翻页；资源超限可能关闭复用连接。这些均有明确测试与操作说明。最终审查未留下未解决的阻塞项，协议验证范围保持如下。
 
 ## 未覆盖的协议与环境
 

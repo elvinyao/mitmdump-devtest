@@ -1,17 +1,28 @@
 import base64
 import socket
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 
 import pytest
 from aiohttp import web
 
 from fault_engine.config import Config
 
+_allocated_ports: set[int] = set()
+
 
 def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+    # Several tests choose service/admin ports before binding either listener.
+    # Keep rejected candidates reserved and never hand out a prior test's port again.
+    # This prevents duplicate selections; it cannot reserve ports against other processes.
+    with ExitStack() as reservations:
+        for _ in range(128):
+            sock = reservations.enter_context(socket.socket())
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            if port not in _allocated_ports:
+                _allocated_ports.add(port)
+                return port
+    raise RuntimeError("could not allocate a distinct test port")
 
 
 @pytest.fixture
@@ -33,8 +44,8 @@ async def upstream():
     app.router.add_route("*", "/{tail:.*}", handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = free_port()
-    await web.TCPSite(runner, "127.0.0.1", port).start()
+    await web.TCPSite(runner, "127.0.0.1", 0).start()
+    port = runner.addresses[0][1]
     try:
         yield f"http://127.0.0.1:{port}", calls
     finally:

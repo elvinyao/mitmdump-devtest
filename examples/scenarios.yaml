@@ -15,6 +15,10 @@ admin:
 state:
   capacity: 10000
   ttl_seconds: 3600
+limits:
+  max_connections: 256
+  max_inflight_requests: 128
+  state_page_size: 1000
 rules:
   - id: retry-twice
     service: orders

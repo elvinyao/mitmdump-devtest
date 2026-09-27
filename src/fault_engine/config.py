@@ -23,6 +23,8 @@ from pydantic import (
     model_validator,
 )
 
+from fault_engine.matching import REGEX_LENGTH_LIMIT, compile_path_pattern
+
 TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 IDENTIFIER = r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$"
 Port = Annotated[int, Field(ge=1, le=65535)]
@@ -90,7 +92,11 @@ class Service(Model):
 class Match(Model):
     methods: list[str] | None = None
     path: str | None = None
-    path_regex: str | None = None
+    path_regex: str | None = Field(
+        default=None,
+        max_length=REGEX_LENGTH_LIMIT,
+        description="Rust-regex full match; lookaround and backreferences are unsupported.",
+    )
     headers: dict[str, str] = Field(default_factory=dict)
     query: dict[str, str] = Field(default_factory=dict)
 
@@ -118,10 +124,7 @@ class Match(Model):
         if self.path is not None and (not self.path.startswith("/") or "?" in self.path):
             raise ValueError("path must start with / and exclude query")
         if self.path_regex is not None:
-            try:
-                re.compile(self.path_regex)
-            except re.error as exc:
-                raise ValueError("invalid path_regex") from exc
+            compile_path_pattern(self.path_regex)
         return self
 
 
@@ -230,6 +233,12 @@ class StateConfig(Model):
     ttl_seconds: float = Field(default=3600.0, gt=0)
 
 
+class LimitsConfig(Model):
+    max_connections: int = Field(default=256, ge=1, le=100_000)
+    max_inflight_requests: int = Field(default=128, ge=1, le=100_000)
+    state_page_size: int = Field(default=1000, ge=1, le=10_000)
+
+
 class AdminConfig(Model):
     host: str = "127.0.0.1"
     port: Port = 9090
@@ -246,6 +255,7 @@ class Config(Model):
     services: list[Service] = Field(min_length=1)
     rules: list[Rule] = Field(default_factory=list)
     state: StateConfig = Field(default_factory=StateConfig)
+    limits: LimitsConfig = Field(default_factory=LimitsConfig)
     admin: AdminConfig = Field(default_factory=AdminConfig)
     body_limit: int = Field(default=10_485_760, ge=1, le=1_073_741_824)
     upstream_ca: str | None = None

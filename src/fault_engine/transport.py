@@ -5,15 +5,20 @@ import socket
 import struct
 from contextlib import suppress
 
+from fault_engine.limits import Lease, ResourceBudget
+
 
 class TCPBridge:
-    def __init__(self, target_host: str, target_port: int):
+    def __init__(self, target_host: str, target_port: int, *, budget: ResourceBudget | None = None):
         self.target_host = target_host
         self.target_port = target_port
         self._server: asyncio.Server | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._clients: set[asyncio.StreamWriter] = set()
         self._peers: dict[tuple, tuple[asyncio.StreamWriter, asyncio.Task[None]]] = {}
+        self.budget = budget or ResourceBudget()
+        self._leases: dict[asyncio.StreamWriter, Lease] = {}
+        self._replies: dict[asyncio.StreamWriter, bytes] = {}
 
     @property
     def port(self) -> int:
@@ -27,10 +32,25 @@ class TCPBridge:
         self._server = await asyncio.start_server(self._accept, host, port)
 
     def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        lease = self.budget.connections.acquire()
+        if lease is None:
+            writer.transport.abort()
+            return
+        self._leases[writer] = lease
         self._clients.add(writer)
         task = asyncio.create_task(self._connect(reader, writer))
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+
+        def finished(task: asyncio.Task[None]) -> None:
+            self._tasks.discard(task)
+            self._clients.discard(writer)
+            self._replies.pop(writer, None)
+            self._leases.pop(writer, None)
+            # Also runs when cancellation precedes the coroutine's first step.
+            writer.transport.abort()
+            lease.release()
+
+        task.add_done_callback(finished)
 
     def owns(self, peer: tuple) -> bool:
         connection = self._peers.get(peer)
@@ -52,6 +72,23 @@ class TCPBridge:
         self._peers.pop(peer, None)
         writer.transport.abort()
         task.cancel()
+        return True
+
+    async def reject(self, peer: tuple, response: bytes) -> bool:
+        """Stop relaying and send bounded caller-provided bytes before closing.
+
+        The relay task retains sole ownership of the public writer and its lease.
+        This transport layer does not interpret the response protocol.
+        """
+        if len(response) > 4096:
+            raise ValueError("rejection response is too large")
+        connection = self._peers.pop(peer, None)
+        if connection is None or connection[0].is_closing():
+            return False
+        writer, task = connection
+        self._replies[writer] = response
+        task.cancel()
+        await asyncio.shield(asyncio.gather(task, return_exceptions=True))
         return True
 
     @staticmethod
@@ -85,12 +122,15 @@ class TCPBridge:
         except (OSError, ConnectionError):
             pass
         finally:
+            reply = self._replies.pop(writer, None)
             if peer is not None:
                 self._peers.pop(peer, None)
             for relay in relays:
                 relay.cancel()
             writers = [writer] if internal_writer is None else [writer, internal_writer]
             for stream in writers:
+                if stream is writer and reply is not None:
+                    continue
                 if completed:
                     stream.close()
                 else:
@@ -98,6 +138,17 @@ class TCPBridge:
                     stream.transport.abort()
             try:
                 await asyncio.gather(*relays, return_exceptions=True)
+                if reply is not None:
+                    # A stalled reader must not hold a connection lease indefinitely.
+                    try:
+                        with suppress(TimeoutError, OSError):
+                            async with asyncio.timeout(0.5):
+                                writer.write(reply)
+                                await writer.drain()
+                                writer.close()
+                                await writer.wait_closed()
+                    finally:
+                        writer.transport.abort()
                 for stream in writers:
                     with suppress(OSError):
                         await stream.wait_closed()
@@ -121,6 +172,10 @@ class TCPBridge:
         for writer in self._clients:
             with suppress(OSError):
                 await writer.wait_closed()
+        for lease in self._leases.values():
+            lease.release()
+        self._leases.clear()
+        self._replies.clear()
         self._clients.clear()
         self._tasks.clear()
         self._peers.clear()
