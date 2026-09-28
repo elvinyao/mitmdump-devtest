@@ -24,6 +24,8 @@ def _action_summary(action: ActionPlan) -> dict[str, str | int | float]:
         summary.update(status=action.status, delay_seconds=action.delay_seconds)
     if action.seconds is not None:
         summary["seconds"] = action.seconds
+    if action.jitter_seconds:
+        summary["jitter_seconds"] = action.jitter_seconds
     return summary
 
 
@@ -85,6 +87,8 @@ def make_admin(config: Config | ExecutionPlan, engine: Engine, token: str) -> we
                         "service": r.service,
                         "scope": r.scope,
                         "start_at": r.start_at,
+                        "probability": r.probability,
+                        "seed": r.seed,
                         "after_sequence": r.after_sequence,
                         "actions": [a.action for a in r.sequence],
                         "match": {

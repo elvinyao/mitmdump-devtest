@@ -1,5 +1,15 @@
 # 场景手册
 
+新增三个按 seed 重放的场景，均需 `X-Test-Run-ID`：
+
+| 路径 | 行为 |
+| --- | --- |
+| `/sampled-unavailable` | 约 25% 返回 503，其余透传；seed=42 |
+| `/latency-jitter` | 完整后端响应后额外等待 50–200 ms |
+| `/occasional-slow` | 约 5% 在完整后端响应后额外等待 1–2 秒 |
+
+比例是概率，不是每批的精确配额；同 ID reset 后重放，新 ID 改变样本。参见 [模式调研](fault-patterns.md)。
+
 先按 [README](../README.md) 启动完整演示，再从另一终端执行下面的 runner 命令。所有规则来自 [scenarios.yaml](../examples/scenarios.yaml)；除 inventory `/cycle` 使用宿主机端口 18081，其余使用 18080。
 
 表中的“后端”表示真实透传，演示后端返回 200；接入真实服务后不保证成功。“测试 ID”表示必须携带 `X-Test-Run-ID`，同一逻辑调用的重试保持相同 ID，不同测试使用不同 ID。未标注的规则使用 `global` 计数。

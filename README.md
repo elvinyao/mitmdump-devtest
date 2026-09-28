@@ -7,7 +7,8 @@
 - 支持 `429 → 429 → 真实后端`、第 n 次开始失败、循环场景和固定 mock 响应。
 - 按测试请求头隔离计数，管理 API 查询状态和重置。
 - Linux Docker 中验证真实 `ECONNRESET`（errno 104），与 HTTP 504、普通断连分别测试。
-- 支持后端已执行后再返回错误或断连，验证写入重试与幂等性；附带 30 条可运行场景。
+- 支持后端已执行后再返回错误或断连，验证写入重试与幂等性；附带 33 条可运行场景。
+- 支持固定 seed 的故障采样与延迟抖动，reset 后可重放，不同 scope 不共享随机数状态。
 - 提供条件匹配、维护窗口豁免、循环恢复、缓存 304、DELETE 204 和二进制下载示例。
 - 使用非回溯正则和只读执行计划；连接与在途请求可设上限，管理状态支持分页。
 
@@ -34,6 +35,8 @@ bash .agent/run.sh sh -c 'for i in 1 2 3; do curl -sS -o /dev/null -w "%{http_co
 下一步可按[场景手册](docs/scenarios.md)选择用例，按测试 ID 查询状态和重置。编辑自定义 YAML 前可运行 `bash .agent/run.sh uv run fault-engine schema` 查看配置 JSON Schema；语法和重复键错误会指出行、列。runner 用法见 `bash .agent/run.sh --help`。
 
 ## 文档与验证
+
+常用故障模式及后续改善取舍见 [模式调研](docs/fault-patterns.md)。
 
 - [使用文档](docs/usage.md)：配置完整说明、故障区别、真实后端接入、管理 API。
 - [场景手册](docs/scenarios.md)：完整场景目录、定向故障、并发隔离与重复运行步骤。

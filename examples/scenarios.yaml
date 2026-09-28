@@ -20,6 +20,39 @@ limits:
   max_inflight_requests: 128
   state_page_size: 1000
 rules:
+  - id: sampled-unavailable
+    service: orders
+    match: {path: /sampled-unavailable}
+    scope: X-Test-Run-ID
+    probability: 0.25
+    seed: 42
+    sequence:
+      - action: respond
+        status: 503
+        headers: {Retry-After: '1'}
+        json_body: {error: sampled_unavailable}
+    after_sequence: repeat_last
+  - id: latency-jitter
+    service: orders
+    match: {path: /latency-jitter}
+    scope: X-Test-Run-ID
+    seed: 42
+    sequence:
+      - action: delay_after
+        seconds: 0.05
+        jitter_seconds: 0.15
+    after_sequence: repeat_last
+  - id: occasional-slow-response
+    service: orders
+    match: {path: /occasional-slow}
+    scope: X-Test-Run-ID
+    probability: 0.05
+    seed: 42
+    sequence:
+      - action: delay_after
+        seconds: 1
+        jitter_seconds: 1
+    after_sequence: repeat_last
   - id: retry-twice
     service: orders
     match:

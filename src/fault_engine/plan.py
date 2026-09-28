@@ -56,6 +56,7 @@ class ActionPlan:
     status: int | None = None
     seconds: float | None = None
     delay_seconds: float = 0
+    jitter_seconds: float = 0
     headers: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     wire_headers: tuple[tuple[bytes, bytes], ...] = ()
     body: bytes = field(default=b"", repr=False)
@@ -79,6 +80,8 @@ class RulePlan:
     after_sequence: str
     cumulative_repeats: tuple[int, ...]
     total_repeats: int
+    probability: float
+    seed: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +107,7 @@ def _action_plan(action: Action) -> ActionPlan:
             repeat=action.repeat,
             status=action.status,
             delay_seconds=action.delay_seconds,
+            jitter_seconds=action.jitter_seconds,
             headers=MappingProxyType(headers),
             wire_headers=tuple(
                 (name.encode("ascii"), value.encode("latin-1")) for name, value in headers.items()
@@ -115,6 +119,7 @@ def _action_plan(action: Action) -> ActionPlan:
         action=action.action,
         repeat=action.repeat,
         seconds=action.seconds if isinstance(action, Delay) else None,
+        jitter_seconds=action.jitter_seconds if isinstance(action, Delay) else 0,
     )
 
 
@@ -149,6 +154,8 @@ def compile_plan(config: Config | ExecutionPlan) -> ExecutionPlan:
                 after_sequence=rule.after_sequence,
                 cumulative_repeats=cumulative_repeats,
                 total_repeats=cumulative_repeats[-1],
+                probability=rule.probability,
+                seed=rule.seed,
             )
         )
     return ExecutionPlan(

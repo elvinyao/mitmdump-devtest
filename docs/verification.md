@@ -1,13 +1,13 @@
 # 验收记录
 
-最近完整验证日期：2026-09-27。环境：Docker/OrbStack 中的 Linux、Python 3.12.14。依赖由 uv.lock 锁定，其中 mitmproxy 12.2.3、ruff 0.16.8、ty 0.0.83、pytest 9.1.1。
+最近完整验证日期：2026-09-29。环境：Docker/OrbStack 中的 Linux、Python 3.12.14。依赖由 uv.lock 锁定，其中 mitmproxy 12.2.3、ruff 0.16.8、ty 0.0.83、pytest 9.1.1。
 
 ## 结果
 
-- **304 tests passed，0 failed，0 skipped**，在上一轮 230 项基础上增加 74 项架构与边界回归。
-- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**96%**（1196 个 statement、344 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
+- **328 tests passed，0 failed，0 skipped**，在上一轮 304 项基础上增加 24 项可复现采样与抖动回归。
+- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**96%**（1225 个 statement、354 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
 - `uv lock --check`、`uv sync --locked`、`ruff format --check .`、`ruff check .`、`ty check` 全部通过。
-- `uv build` 成功生成 wheel 和 sdist。独立虚拟环境离线安装 wheel，确认从安装路径导入，schema、HTTP mock 及请求/响应 trailer 拒绝检查通过。生产锁文件作为版本约束，依赖由 wheel 元数据决定。配置验证返回 `valid: 2 services, 30 rules`。
+- `uv build` 成功生成 wheel 和 sdist。独立虚拟环境离线安装 wheel，确认从安装路径导入，schema、HTTP mock 及请求/响应 trailer 拒绝检查通过。生产锁文件作为版本约束，依赖由 wheel 元数据决定。配置验证返回 `valid: 2 services, 33 rules`。
 - 完整检查通过 `sh -lc` 执行。上一轮已验证登录 shell 的 `uv` 与 `uvx` 均为 0.12.17，本轮沿用同一工具链。
 - 程序和 Docker runner 都实际运行过，测试没有用 mock 替代 mitmproxy 或 TCP reset。
 - 测试保留了 **42 条第三方弃用警告**：mitmproxy 使用 pyparsing 的旧 API，以及 ldap3 对 pyasn1 旧导出的引用。没有将这些警告隐藏或描述为零警告。
@@ -78,7 +78,9 @@ bash .agent/run.sh bash .agent/check-wheel.sh
 | 拒绝响应的协议与释放 | 同一文件验证输出阻塞最多等待 0.5 秒后释放；已成功响应 4 MiB 数据后的管道请求若超限，只关闭连接而不把 503 插入上一响应 |
 | 有界管理分页与过期清理 | test_execution_plan.py 与 test_resource_limits.py 验证过滤绑定游标、创建顺序、固定 ID 上界、空页继续、历史 reset 空洞、过期积压和当前 scope 重启 |
 
-测试分布：architecture_integration 1、boundaries 11、CLI 12、config 36、demo 1、dependency_compat 5、engine 10、example_catalog 18、execution_plan 23、extended_scenarios 19、http_review 13、integration 36、lifecycle_review 9、maintainability 14、network_edges 10、regex_safety 17、resource_limits 24、runner 6、runtime_rollback 4、state_review 26、transport 9。
+新增 test_sampling.py 的 24 项验证：0/1 概率边界、严格配置、seed/reset 重放、并发 scope 隔离、五种延迟动作、只读计划、概率与延迟通道独立、start_at/cycle 位置、真实 HTTP 后端调用次数、管理摘要和实际延迟日志。全目录可达性测试同时覆盖新增三个示例。
+
+测试分布：architecture_integration 1、boundaries 11、CLI 12、config 36、demo 1、dependency_compat 5、engine 10、example_catalog 18、execution_plan 23、extended_scenarios 19、http_review 13、integration 36、lifecycle_review 9、maintainability 14、network_edges 10、regex_safety 17、resource_limits 24、runner 6、runtime_rollback 4、sampling 24、state_review 26、transport 9。
 
 ## 实际端口映射体验
 

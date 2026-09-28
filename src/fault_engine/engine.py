@@ -11,7 +11,7 @@ import uuid
 from bisect import bisect_right
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from fault_engine.config import Config
 from fault_engine.plan import PASSTHROUGH, ActionPlan, ExecutionPlan, RulePlan, compile_plan
@@ -31,6 +31,7 @@ class Decision:
     scope: str
     ordinal: int
     action: ActionPlan
+    sampled: bool = True
 
 
 @dataclass
@@ -120,10 +121,35 @@ class Engine:
             counter.count += 1
             counter.touched = now
             self._counters.move_to_end(key)
-            return Decision(
-                service, rule.id, scope, counter.count, self._select(rule, counter.count)
+            action = self._select(rule, counter.count)
+            sampled = rule.probability == 1 or (
+                rule.probability > 0
+                and self._fraction(rule, scope, counter.count, "probability") < rule.probability
             )
+            if not sampled:
+                action = PASSTHROUGH
+            elif action.jitter_seconds:
+                extra = action.jitter_seconds * self._fraction(rule, scope, counter.count, "delay")
+                action = replace(
+                    action,
+                    seconds=action.seconds + extra if action.seconds is not None else None,
+                    delay_seconds=action.delay_seconds + extra if action.status is not None else 0,
+                    jitter_seconds=0,
+                )
+            return Decision(service, rule.id, scope, counter.count, action, sampled)
         return None
+
+    @staticmethod
+    def _fraction(rule: RulePlan, scope: str, ordinal: int, channel: str) -> float:
+        # Stateless, versioned sampling: other scopes and scheduling cannot advance
+        # a shared RNG. Separate channels decouple delay from probability selection.
+        material = json.dumps(
+            ["fault-sample-v1", rule.seed, rule.service, rule.id, scope, ordinal, channel],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode()
+        value = int.from_bytes(hashlib.sha256(material).digest()[:8], "big") >> 11
+        return value / (1 << 53)
 
     @staticmethod
     def _select(rule: RulePlan, ordinal: int) -> ActionPlan:

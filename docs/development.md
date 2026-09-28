@@ -46,6 +46,10 @@ Runtime 现在在构造 Master 前拒绝第二个活跃实例。生命周期锁�
 
 `path_regex` 用 Pydantic Core 的 Rust regex 显式编译，禁止回退到 Python re。先验证原表达式，再加完整路径锚点，避免不平衡分组逃出包装。原模式限制 4096 字符；不支持环视和反向引用。反例回归放在有外层超时的独立子进程中，防止意外恢复回溯实现时挂住整套测试。
 
+## 可复现采样
+
+RulePlan 保存 probability/seed，ActionPlan 保存 jitter_seconds。Engine 分配序号并选择步骤后，以版本化 SHA-256 输入生成概率与延迟的独立样本；未抽中直接选择共享 PASSTHROUGH，不尝试下一条规则。抖动通过 dataclasses.replace 创建本次动作，只读配置仍保留原始基础值与 jitter。禁止改为进程全局 random 状态，否则不同 scope 的并发会改变重放结果。更新采样算法需明确版本兼容性；tests/test_sampling.py 覆盖 reset、scope 隔离、序列位置、通道独立及真实 HTTP。
+
 ## 资源配额
 
 每个 Runtime 只创建一个 ResourceBudget，所有 TCPBridge 与 FaultAddon 共享。连接接受时取得连接凭据，结束时幂等释放；超过上限即关闭。请求从 requestheaders 开始占位，覆盖请求体、上游等待和各阶段延迟，响应 hook 完成、错误、客户端断开或关闭时归还。管理监听器不消耗数据面配额。

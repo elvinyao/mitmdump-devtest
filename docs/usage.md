@@ -142,6 +142,31 @@ HTTPS upstream 默认验证证书，系统信任根可直接使用；私有 CA �
 
 ## 4. 故障动作
 
+### 可复现的比例与抖动
+
+规则可设置 `probability`（0–1，默认 1）和 `seed`（0–2147483647 的整数，默认 0）。先按匹配及次数选择步骤，再决定执行；未抽中的请求透传，仍消耗该规则序号，不再尝试后续规则。0 全部透传，1 保持旧行为。有限请求中的比例不保证精确等于配置值；精确“两次失败一次成功”仍用 sequence/cycle。
+
+`respond`、`respond_after`、`delay_before`、`delay_after`、`timeout` 可设置 `jitter_seconds`（默认 0）。实际等待为基础秒数加上 `[0, jitter_seconds)` 的均匀抖动；基础值与抖动上限之和不得超过 3600 秒。基础值分别取 delay_seconds 或 seconds；其他动作不接受 jitter。偶发长延迟可组合低 probability 与较大 seconds，尚无 lognormal 分布。
+
+```yaml
+- id: flaky-api
+  service: orders
+  match: {path: /flaky}
+  scope: X-Test-Run-ID
+  probability: 0.25
+  seed: 42
+  sequence:
+    - action: respond
+      status: 503
+      delay_seconds: 0.05
+      jitter_seconds: 0.15
+  after_sequence: repeat_last
+```
+
+约 25% 的匹配请求等待 50–200 ms 后返回 503，其余访问后端。seed、服务、规则 ID、scope 和序号共同决定样本；同 scope reset、TTL 过期或重启后重放相同序列。其他 scope 的请求顺序不影响它；同 scope 内并发仍按进入引擎的顺序分配，重排可能改变某个业务请求对应的故障。改变 seed 或 scope 会改变样本。
+
+概率与延迟使用不同通道，修改 probability 不改变相同序号被选中时的等待值。`/rules` 返回 probability、seed 和配置的 jitter_seconds；日志新增 sampled 与实际 delay_seconds。sampled 仅表示通过概率门控，start_at 前、passthrough 步骤或序列结束后仍可能透传。在途实际动作已经固定，reset 不会改变它。
+
 每个动作可带 `repeat`（正整数，默认 1）。
 
 | action | 参数 | 行为 |

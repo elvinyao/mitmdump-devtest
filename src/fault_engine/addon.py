@@ -54,6 +54,14 @@ class FaultAddon:
                     "rule": decision.rule_id if decision else None,
                     "scope": decision.scope[:64] if decision else None,
                     "ordinal": decision.ordinal if decision else None,
+                    "sampled": decision.sampled if decision else None,
+                    "delay_seconds": (
+                        decision.action.seconds
+                        if decision and decision.action.seconds is not None
+                        else decision.action.delay_seconds
+                        if decision
+                        else None
+                    ),
                     "action": decision.action.action if decision else "passthrough",
                     "phase": phase,
                     "result": result,

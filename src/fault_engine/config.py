@@ -140,6 +140,7 @@ class Respond(Step):
     action: Literal["respond", "respond_after"]
     status: int = Field(ge=200, le=599)
     delay_seconds: float = Field(default=0, ge=0, le=3600)
+    jitter_seconds: float = Field(default=0, ge=0, le=3600)
     headers: dict[str, str] = Field(default_factory=dict)
     body: str | None = None
     json_body: JsonValue = None
@@ -147,6 +148,8 @@ class Respond(Step):
 
     @model_validator(mode="after")
     def valid_body(self) -> Self:
+        if self.delay_seconds + self.jitter_seconds > 3600:
+            raise ValueError("delay_seconds plus jitter_seconds must not exceed 3600")
         body_fields = {"body", "json_body", "body_base64"} & self.model_fields_set
         if len(body_fields) > 1:
             raise ValueError("choose only one body encoding")
@@ -183,6 +186,13 @@ class Respond(Step):
 class Delay(Step):
     action: Literal["delay_before", "delay_after", "timeout"]
     seconds: float = Field(gt=0, le=3600)
+    jitter_seconds: float = Field(default=0, ge=0, le=3600)
+
+    @model_validator(mode="after")
+    def bounded_delay(self) -> Self:
+        if self.seconds + self.jitter_seconds > 3600:
+            raise ValueError("seconds plus jitter_seconds must not exceed 3600")
+        return self
 
 
 class Disconnect(Step):
@@ -198,6 +208,8 @@ class Rule(Model):
     match: Match = Field(default_factory=Match)
     scope: str = "global"
     start_at: int = Field(default=1, ge=1)
+    probability: float = Field(default=1, ge=0, le=1)
+    seed: int = Field(default=0, ge=0, le=2_147_483_647)
     sequence: list[Action] = Field(min_length=1)
     after_sequence: Literal["passthrough", "repeat_last", "cycle"] = "passthrough"
 
