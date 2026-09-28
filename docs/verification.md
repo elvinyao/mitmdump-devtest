@@ -4,11 +4,11 @@
 
 ## 结果
 
-- **328 tests passed，0 failed，0 skipped**，在上一轮 304 项基础上增加 24 项可复现采样与抖动回归。
-- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**96%**（1225 个 statement、354 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
+- **464 tests passed，0 failed，0 skipped**，在上一轮 328 项基础上增加 136 项配置生成、匹配解释、请求记录、管理客户端和真实 CLI 验收回归；pytest 用时 77.51 秒。
+- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**96%**（1659 个 statement、504 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
 - `uv lock --check`、`uv sync --locked`、`ruff format --check .`、`ruff check .`、`ty check` 全部通过。
-- `uv build` 成功生成 wheel 和 sdist。独立虚拟环境离线安装 wheel，确认从安装路径导入，schema、HTTP mock 及请求/响应 trailer 拒绝检查通过。生产锁文件作为版本约束，依赖由 wheel 元数据决定。配置验证返回 `valid: 2 services, 33 rules`。
-- 完整检查通过 `sh -lc` 执行。上一轮已验证登录 shell 的 `uv` 与 `uvx` 均为 0.12.17，本轮沿用同一工具链。
+- `uv build` 成功生成 wheel 和 sdist。独立虚拟环境离线安装 wheel，确认从安装路径导入，schema、init/validate/explain、requests/verify/reset/journal-clear、HTTP mock 及请求/响应 trailer 拒绝检查通过。生产锁文件作为版本约束，依赖由 wheel 元数据决定。示例目录保持 2 个服务、33 条规则。
+- 本轮完整检查由 `bash .agent/run.sh bash .agent/check.sh` 执行，退出 0；格式检查覆盖 58 个文件。上一轮已验证登录 shell 的 uv 与 uvx 均为 0.12.17，本轮沿用同一工具链。
 - 程序和 Docker runner 都实际运行过，测试没有用 mock 替代 mitmproxy 或 TCP reset。
 - 测试保留了 **42 条第三方弃用警告**：mitmproxy 使用 pyparsing 的旧 API，以及 ldap3 对 pyasn1 旧导出的引用。没有将这些警告隐藏或描述为零警告。
 
@@ -18,7 +18,7 @@
 bash .agent/run.sh bash .agent/check.sh
 ```
 
-本轮实际运行完整检查，并在末次审查加强 Engine 正则回归与 wheel 依赖检查后分别复验：
+早期架构轮次加强 Engine 正则回归与 wheel 依赖检查的历史复验命令（当前验收以本轮完整 check 为准）：
 
 ```bash
 bash .agent/run.sh sh -lc 'uv run --no-sync ruff format . && bash .agent/check.sh'
@@ -77,10 +77,15 @@ bash .agent/run.sh bash .agent/check-wheel.sh
 | 连接/在途资源限额 | test_resource_limits.py 验证跨服务共享预算、慢上传先占位、首请求 POST/HEAD 容量拒绝、延迟期间不提前释放、RST 客户端互不影响及首步前取消 |
 | 拒绝响应的协议与释放 | 同一文件验证输出阻塞最多等待 0.5 秒后释放；已成功响应 4 MiB 数据后的管道请求若超限，只关闭连接而不把 503 插入上一响应 |
 | 有界管理分页与过期清理 | test_execution_plan.py 与 test_resource_limits.py 验证过滤绑定游标、创建顺序、固定 ID 上界、空页继续、历史 reset 空洞、过期积压和当前 scope 重启 |
+| 配置模板与离线诊断 | test_local_commands.py 的 31 项验证四种合法模板、无 token、校验先于独占写入、文件不覆盖、匹配/采样复用、状态与 TTL 不变、scope 脱敏和真实 mitmproxy 非法 UTF-8 query 解码一致 |
+| 请求记录与证据完整性 | test_journal.py 的 11 项覆盖进入顺序、幂等终结、容量/clear 丢失边界、跨实例/未来游标、过滤分页、pending/关闭时禁止通过、精确次数/状态/单调间隔与只读返回 |
+| Journal 真实网络集成 | test_journal_integration.py 的 28 项验证 503/503/200 恰好三条、后端调用、请求数据不存储、reset/timeout/after/取消/上游失败、鉴权、严格参数和 4 KiB 上限 |
+| 管理客户端错误契约 | test_admin_client.py 的 60 项覆盖四命令、token/URL、超时、重定向、代理隔离、401/拒绝连接、畸形或过大响应、深层 JSON 序列化失败及 0/1/2 退出码 |
+| 完整 CLI 验收与重跑 | test_usability_workflow.py 的 6 项通过真实子进程运行 init→validate→explain→serve→503/503/200→requests→verify，断言错误退出 1、scope 隔离、reset/clear/checkpoint 重跑，以及 HTTP/HTML/重定向/超时/拒绝连接退出 2 |
 
 新增 test_sampling.py 的 24 项验证：0/1 概率边界、严格配置、seed/reset 重放、并发 scope 隔离、五种延迟动作、只读计划、概率与延迟通道独立、start_at/cycle 位置、真实 HTTP 后端调用次数、管理摘要和实际延迟日志。全目录可达性测试同时覆盖新增三个示例。
 
-测试分布：architecture_integration 1、boundaries 11、CLI 12、config 36、demo 1、dependency_compat 5、engine 10、example_catalog 18、execution_plan 23、extended_scenarios 19、http_review 13、integration 36、lifecycle_review 9、maintainability 14、network_edges 10、regex_safety 17、resource_limits 24、runner 6、runtime_rollback 4、sampling 24、state_review 26、transport 9。
+原有测试分布：architecture_integration 1、boundaries 11、CLI 12、config 36、demo 1、dependency_compat 5、engine 10、example_catalog 18、execution_plan 23、extended_scenarios 19、http_review 13、integration 36、lifecycle_review 9、maintainability 14、network_edges 10、regex_safety 17、resource_limits 24、runner 6、runtime_rollback 4、sampling 24、state_review 26、transport 9。易用性扩展增加上表五组共 136 项。
 
 ## 实际端口映射体验
 
@@ -98,6 +103,10 @@ bash .agent/run.sh bash .agent/check-wheel.sh
 精确 RST 的验收证据是**容器内直连的两层真实 socket 测试**。不能把该结论扩展到任何 NAT/TCP 代理之后；当前 OrbStack 映射的行为差异已写入使用文档。
 
 ## 独立审查与修复
+
+2026-09-29 易用性扩展先提交 superpowers 设计和实施计划。TDD 失败证据包括：init/explain 28 项因命令/方法不存在失败，Journal 导入失败，HTTP /requests 返回 404，管理客户端导入失败，以及完整 CLI 流程因 journal-clear 未注册失败。实现后分别通过，再执行独立需求审查和质量审查。
+
+需求审查发现 explain 回显测试 scope 原值，与“无 header/query 值”约定冲突；已删除输出字段并保留内部采样。质量审查复现非法 UTF-8 query 被替换为 U+FFFD 导致离线与实际匹配不同，改用 mitmproxy 相同的 surrogateescape；另复现约 2.5 KiB 的深层管理 JSON 可解析却在输出时抛 RecursionError，现于任何 stdout 输出前捕获并返回静态错误/退出 2。三个问题均先保留失败回归、修复后通过，独立复核确认关闭；最终规格审查 A/B/C 无未完成项。需求审查另执行 journal+集成 39 项、local+完整 CLI 37 项通过。
 
 采用 superpowers 的设计、计划、TDD、根因定位与完成前验证流程，子代理执行 transport 实现和独立审查。先做需求审查，再做质量审查，反馈修复后复核。
 

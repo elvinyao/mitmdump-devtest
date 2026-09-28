@@ -30,6 +30,7 @@ class LimitsPlan:
     max_connections: int
     max_inflight_requests: int
     state_page_size: int
+    journal_capacity: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +169,7 @@ def compile_plan(config: Config | ExecutionPlan) -> ExecutionPlan:
             config.limits.max_connections,
             config.limits.max_inflight_requests,
             config.limits.state_page_size,
+            config.limits.journal_capacity,
         ),
         body_limit=config.body_limit,
         upstream_ca=config.upstream_ca,

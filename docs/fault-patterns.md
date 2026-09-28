@@ -9,6 +9,8 @@
 | 有状态流程 | 创建后查询、轮询 pending→ready；[WireMock scenarios](https://wiremock.org/docs/stateful-behaviour/) 提供状态机 | 已有按次序列，尚无跨规则状态机 |
 | 局部响应修改 | 保留真实数据，仅改 header/JSON；[Chaos Mesh HTTPChaos](https://chaos-mesh.org/docs/simulate-http-chaos-on-kubernetes/) 提供 replace/patch | 已有完整 respond_after 替换，尚无局部 patch |
 | 传输阶段故障 | 大响应下载中断、低带宽；[Toxiproxy](https://github.com/Shopify/toxiproxy) 提供 bandwidth、slow_close、limit_data 等 | 已有连接级 reset，尚无限速或指定字节后截断 |
+| 请求观察与断言 | [WireMock verifying](https://wiremock.org/docs/verifying/) 提供 request journal、请求计数和匹配诊断 | 新增有界脱敏记录、精确次数/状态序列/进入间隔 verify、离线 explain |
+| 独立管理入口 | [Envoy admin](https://www.envoyproxy.io/docs/envoy/latest/operations/admin.html) 提供独立运维接口 | 保留独立鉴权入口，新增无需配置文件的管理 CLI |
 
 ## 本轮实现选择
 
@@ -18,15 +20,17 @@
 
 示例新增 25% 503、50–200 ms 抖动、5% 的 1–2 秒慢响应；详见 [场景手册](scenarios.md)。
 
+本轮易用性扩展继续借鉴 WireMock 的“配置、观察、验证”和 Envoy 的独立管理入口：init 生成四种模板，explain 复用实际 matcher/sample，requests/verify 提供有界请求证据。CLI 可直接把验证结果转为 CI 退出码。保留和记录的只有明确字段，历史丢失或未完成请求不能判为通过；不声称兼容这些工具的协议。
+
 ## 后续优先级建议
 
-1. **客户端验收助手**：有界、默认脱敏的事件记录与自动断言，检查重试次数、间隔、Idempotency-Key 保留和取消后无重试。现有工具制造故障与展示计数，尚不能自动判断业务策略是否正确，这是最直接的下一步价值。
+1. **更精确的客户端验收**：当前已支持有界记录和次数/状态/进入间隔断言；后续可增加响应完成后的退避时间、Idempotency-Key 一致性摘要及取消后的观察窗口。进入间隔包含处理耗时，不能证明 backoff；敏感字段摘要也需要明确配置和存储边界。
 2. **按时间恢复窗口**：服务不可用 5 秒后恢复，用于断路器开启、半开探测和关闭。按次数循环不能替代时间窗口，需可注入时钟、每 scope 起点与 reset 语义。
 3. **响应局部 patch**：缺字段、错类型、改 Retry-After，同时保留真实响应其余内容。需要定义非 JSON/非法 JSON、压缩、HEAD 与 Content-Length 行为。
 4. **流式慢发/中途截断**：首字节正常但 body 慢发或读到部分数据后断连。需要独立的流式执行设计、背压/取消和 socket 验收，完整响应后的 delay 不能代替它。
 5. **跨请求状态机**：异步任务、token 刷新、支付确认流程。状态按 scope 隔离，转换需原子化，避免并行测试互相污染。
 
-以上是结合当前代码的建议。本轮未实现这五项，也未引入外部服务。
+以上是结合当前代码的后续建议；第 1 项的基础验收能力已经落地，其列出的进一步验证和第 2–5 项尚未实现，也未引入外部服务。
 
 ## 底座建议
 

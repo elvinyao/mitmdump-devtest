@@ -1,4 +1,4 @@
-"""CLI entry point: validate configuration or run until SIGINT/SIGTERM."""
+"""CLI entry point for local scenario tools and running the proxy."""
 
 import argparse
 import asyncio
@@ -11,7 +11,9 @@ import sys
 import yaml
 from pydantic import TypeAdapter, ValidationError
 
+from fault_engine.admin_client import ADMIN_COMMANDS, register_admin_commands, run_admin_command
 from fault_engine.config import Action, Config, load_config
+from fault_engine.local_commands import PRESETS, explain_request, make_config, write_config
 
 
 def config_error_location(location: tuple[str | int, ...]) -> str:
@@ -74,15 +76,63 @@ def main(argv: list[str] | None = None) -> int:
         command = subparsers.add_parser(name, help=description, description=description)
         command.add_argument("config", help="YAML scenario configuration")
     subparsers.add_parser("schema", help="Print the configuration JSON Schema for editor tooling")
+    init = subparsers.add_parser(
+        "init", help="Create a validated scenario file without overwriting"
+    )
+    init.add_argument("config", help="New YAML scenario configuration")
+    init.add_argument("--upstream", required=True, help="HTTP(S) upstream origin")
+    init.add_argument("--preset", required=True, choices=PRESETS)
+    init.add_argument("--service", default="backend")
+    init.add_argument("--path", default="/retry")
+    init.add_argument("--port", type=int, default=8080)
+    init.add_argument("--admin-port", type=int, default=9090)
+    explain = subparsers.add_parser("explain", help="Explain rule matching and sampling offline")
+    explain.add_argument("config", help="YAML scenario configuration")
+    explain.add_argument("--service", required=True)
+    explain.add_argument("--method", default="GET")
+    explain.add_argument("--path", required=True, help="Request path, optionally including query")
+    explain.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        help="Request header: Name: value; duplicate names are rejected, supply merged values",
+    )
+    explain.add_argument("--ordinal", type=int, default=1, help="Sequence position (default: 1)")
+    register_admin_commands(subparsers)
     args = parser.parse_args(argv)
+    if args.command in ADMIN_COMMANDS:
+        return run_admin_command(args)
     if args.command == "schema":
         print(json.dumps(Config.model_json_schema(), indent=2))
         return 0
     try:
+        if args.command == "init":
+            config = make_config(
+                upstream=args.upstream,
+                preset=args.preset,
+                service=args.service,
+                path=args.path,
+                port=args.port,
+                admin_port=args.admin_port,
+            )
+            write_config(args.config, config)
+            print("created: validated scenario configuration")
+            return 0
         config = load_config(args.config)
         if args.command == "validate":
             print(f"valid: {len(config.services)} services, {len(config.rules)} rules")
             return 0
+        if args.command == "explain":
+            result = explain_request(
+                config,
+                service=args.service,
+                method=args.method,
+                path=args.path,
+                headers=args.header,
+                ordinal=args.ordinal,
+            )
+            print(json.dumps(result, indent=2))
+            return 2 if result["scope"] is not None and not result["scope"]["valid"] else 0
         token = os.environ.get(config.admin.token_env, "")
         if not token:
             raise ValueError(f"set {config.admin.token_env} to a nonempty admin bearer token")

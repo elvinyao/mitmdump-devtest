@@ -11,6 +11,7 @@
 - 支持固定 seed 的故障采样与延迟抖动，reset 后可重放，不同 scope 不共享随机数状态。
 - 提供条件匹配、维护窗口豁免、循环恢复、缓存 304、DELETE 204 和二进制下载示例。
 - 使用非回溯正则和只读执行计划；连接与在途请求可设上限，管理状态支持分页。
+- `init` 生成配置，`explain` 离线解释匹配；`requests` 查看脱敏记录，`verify` 为 CI 检查请求次数、状态序列和进入间隔。
 
 ## 快速体验
 
@@ -33,6 +34,23 @@ bash .agent/run.sh sh -c 'for i in 1 2 3; do curl -sS -o /dev/null -w "%{http_co
 应依次看到 `429`、`429`、`200`。同一 ID 继续调用会正常转发；换 ID 或 reset 可从头开始。
 
 下一步可按[场景手册](docs/scenarios.md)选择用例，按测试 ID 查询状态和重置。编辑自定义 YAML 前可运行 `bash .agent/run.sh uv run fault-engine schema` 查看配置 JSON Schema；语法和重复键错误会指出行、列。runner 用法见 `bash .agent/run.sh --help`。
+
+把上面的重试结果作为自动验收（演示进程尚在运行，且 scope `demo` 恰好调用过三次）：
+
+```bash
+bash .agent/run.sh sh -lc 'export FAULT_ADMIN_TOKEN=local-demo-token; uv run fault-engine verify --admin-url http://host.docker.internal:19090 --service orders --scope demo --count 3 --statuses 429 429 200'
+```
+
+匹配退出 0，断言失败或记录不完整退出 1，参数/网络错误退出 2。到达间隔包含前一次响应耗时，不能作为客户端退避时间的证明。
+
+接入自己的后端时可先生成并解释配置（以下假定后端位于宿主机 9000）：
+
+```bash
+bash .agent/run.sh uv run fault-engine init retry.yaml --upstream http://host.docker.internal:9000 --preset retry
+bash .agent/run.sh uv run fault-engine explain retry.yaml --service backend --path /retry --header 'X-Test-Run-ID: run-1' --ordinal 1
+```
+
+retry 模板是两次 503 后透传；还有 timeout、reset、jitter 模板。`init` 拒绝覆盖已有文件。完整的[生成→解释→运行→验收→重跑步骤](docs/usage.md#生成配置并完成客户端验收)包含无需外部后端的可复制示例。
 
 ## 文档与验证
 

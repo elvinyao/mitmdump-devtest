@@ -25,14 +25,17 @@ Runtime 现在在构造 Master 前拒绝第二个活跃实例。生命周期锁�
 | config.py | strict pydantic 配置、YAML 重复 key 检查、响应编码与交叉引用 |
 | matching.py | 有长度限制的 Rust regex 完整匹配、语法错误脱敏 |
 | plan.py | 将输入模型编译为只读规则、服务和动作快照，预编码响应与累计 repeat |
-| engine.py | 匹配、序号分配、重复/循环选择、TTL/容量、查询与重置 |
+| engine.py | 共享的纯匹配/采样与 explain、序号分配、TTL/容量、查询与重置 |
 | addon.py | mitmproxy HTTP hooks、异步延迟、mock、故障事件 |
 | transport.py | 不解析 HTTP 的 TCP 字节中继、地址映射、SO_LINGER RST |
 | limits.py | 单事件循环内的共享连接/请求配额与幂等释放凭据 |
+| journal.py | 有界的请求元数据、幂等终结、实例游标和完整性验证 |
 | admin.py | 独立 aiohttp 管理 API、鉴权、输入大小和 reset 校验 |
 | runtime.py | 组装、启动、异常回滚和关闭 |
 | http1_compat.py | 活跃 Runtime 期间安装并在关闭后恢复的 trailer 拒绝适配 |
-| cli.py / __main__.py | validate / serve、token 环境变量、信号处理与退出码 |
+| local_commands.py | 四种配置模板、独占创建文件、离线请求解析与解释 |
+| admin_client.py | 有界管理 HTTP 客户端、环境凭证、断言退出码 |
+| cli.py / __main__.py | 命令注册、配置错误脱敏、serve 信号处理 |
 
 ## 状态与并发不变量
 
@@ -49,6 +52,16 @@ Runtime 现在在构造 Master 前拒绝第二个活跃实例。生命周期锁�
 ## 可复现采样
 
 RulePlan 保存 probability/seed，ActionPlan 保存 jitter_seconds。Engine 分配序号并选择步骤后，以版本化 SHA-256 输入生成概率与延迟的独立样本；未抽中直接选择共享 PASSTHROUGH，不尝试下一条规则。抖动通过 dataclasses.replace 创建本次动作，只读配置仍保留原始基础值与 jitter。禁止改为进程全局 random 状态，否则不同 scope 的并发会改变重放结果。更新采样算法需明确版本兼容性；tests/test_sampling.py 覆盖 reset、scope 隔离、序列位置、通道独立及真实 HTTP。
+
+## 诊断与观察证据
+
+Engine.explain 与 decide 共用匹配失败维度、scope 验证及指定序号的动作选择，但 explain 不访问时钟、计数或过期清理。输出只包含安全摘要，scope 值参与内部采样而不出现在 explain JSON。local_commands 的模板先通过完整 Config 验证，再以 x 模式创建；不可改成检查存在后普通覆盖写入。
+
+每个 Runtime 共享一个 Journal 给 Addon/Admin。Addon 在完整请求体和场景选择之后开始一条观察；不同 hook 的日志事件不直接作为请求计数。Journal 使用 OrderedDict 按进入顺序保存最新 N 条、单调时钟计时；finish 只允许 pending 转为最终结果，客户端断开、请求取消或关闭也必须终结。它不持有 HTTPFlow、网络凭据或任意 body/header/query/path。
+
+Journal 的递增 ID 与 dropped_through 保证历史丢失可见；clear 更新丢失边界而不复用 ID，旧请求完成不会重新插入。cursor 为不应由客户端解析的实例/位置标记，仅作排他下界，不绑定过滤和上界（与 state 游标不同）；翻页保持相同过滤，验收调用方须等待客户端完成。verify 即时校验完整窗口，关闭、缺失或 pending 时不得通过；arrival gap 不能被描述成客户端 backoff。
+
+管理 CLI 不依赖本地配置，凭证只从命名环境变量获取。HTTP 有总超时、响应字节上限，禁止重定向与环境代理；不把远端错误 body 或连接异常详情写入 stderr。错误退出 2，断言失败/不完整退出 1，完整通过退出 0。变更这些契约时同时更新 API、CLI、真实子进程和 wheel 测试。
 
 ## 资源配额
 
@@ -84,7 +97,7 @@ runner 的 `--help` 与缺少命令提示无需 Docker；实际执行仍全部�
 
 `fault-engine schema` 直接从 Pydantic 模型输出 JSON Schema，不另存一份需要同步的静态定义。YAML 错误只输出行列；字段错误只保留已知 schema 路径，禁止回显配置值或自定义字典 key。
 
-完整 check 在构建后调用 `.agent/check-wheel.sh`：将锁定生产依赖导出为版本约束，仅以实际 wheel 为安装目标，离线安装到临时虚拟环境，从仓库外执行 schema、HTTP mock 及双向 trailer 拒绝检查。所需依赖由 wheel 元数据决定，缓存由前面的 `uv sync --locked` 准备。这样验证安装包的依赖声明和导入路径，而不只验证 editable 源码环境。
+完整 check 在构建后调用 `.agent/check-wheel.sh`：将锁定生产依赖导出为版本约束，仅以实际 wheel 为安装目标，离线安装到临时虚拟环境，从仓库外执行 schema、init/validate/explain、管理 CLI、HTTP mock 及双向 trailer 拒绝检查。所需依赖由 wheel 元数据决定，缓存由前面的 `uv sync --locked` 准备。这样验证安装包的依赖声明和导入路径，而不只验证 editable 源码环境。
 
 依赖升级使用 `bash .agent/run.sh uv lock --upgrade-package <package>`，随后执行完整 check。runner 的多个容器共享虚拟环境；不要并发修改依赖或格式化同一文件。无需 sudo 在宿主机安装工具。
 
@@ -103,6 +116,7 @@ runner 的 `--help` 与缺少命令提示无需 Docker；实际执行仍全部�
 - maintainability 覆盖管理过滤、摘要脱敏和过期 reset；example_catalog 还验证完整规则目录的可达性，避免宽泛规则遮蔽其他例子。
 - regex_safety/execution_plan 覆盖非回溯匹配、语法边界、深层只读快照、累计序列、分页和过期积压；architecture_integration 覆盖真实在途响应与 Admin 使用相同 Plan。
 - runtime_rollback/dependency_compat 覆盖重复取消、清理失败重试、依赖版本/API 边界及适配器安装恢复；resource_limits 覆盖慢上传、跨服务配额、拒绝发送超时、复用连接和释放路径。
+- local_commands 覆盖生成器不覆盖文件、纯匹配解释与采样一致；journal/journal_integration 覆盖保留窗口、终结、真实 HTTP 与脱敏；admin_client/usability_workflow 覆盖错误响应、真实 CLI 退出码和 503→503→200 重置重跑。
 
 测试后端直接监听端口 0；需要先写入 Config 的端口由 `free_port()` 保证同一测试进程内不重复分配，避免服务/admin 尚未绑定时得到同一端口。该辅助函数不提供跨进程保留保证；监听器测试应在隔离的 runner 网络中执行。
 

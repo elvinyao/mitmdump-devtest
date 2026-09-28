@@ -2,11 +2,13 @@
 
 import asyncio
 import json
+import os
 import socket
 import subprocess
 import sys
 from contextlib import ExitStack, suppress
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from aiohttp import ClientSession, ClientTimeout
 
@@ -26,6 +28,76 @@ def check_installation() -> None:
         timeout=10,
     )
     assert json.loads(schema_result.stdout)["type"] == "object"
+    with TemporaryDirectory() as directory:
+        config_path = str(Path(directory) / "retry.yaml")
+        for args in (
+            [
+                "init",
+                config_path,
+                "--upstream",
+                "http://127.0.0.1:9",
+                "--preset",
+                "retry",
+                "--service",
+                "wheel",
+            ],
+            ["validate", config_path],
+        ):
+            subprocess.run(
+                [sys.executable, "-m", "fault_engine", *args],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+        explained = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "fault_engine",
+                "explain",
+                config_path,
+                "--service",
+                "wheel",
+                "--path",
+                "/retry",
+                "--header",
+                "X-Test-Run-ID: wheel-run",
+                "--ordinal",
+                "3",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        result = json.loads(explained.stdout)
+        assert result["matched_rule"] == "retry"
+        assert result["decision"]["action"] == "passthrough"
+
+
+async def admin_command(runtime: Runtime, command: str, *args: str, expected: int = 0) -> dict:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "fault_engine",
+        command,
+        "--admin-url",
+        runtime.admin_url,
+        *args,
+        env={**os.environ, "FAULT_ADMIN_TOKEN": "wheel-test"},
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        output, error = await asyncio.wait_for(process.communicate(), 10)
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+    assert process.returncode == expected, error.decode()
+    assert error == b"", error.decode()
+    return json.loads(output)
 
 
 async def main() -> None:
@@ -87,6 +159,40 @@ async def main() -> None:
                 assert response.status == 201
                 assert await response.text() == "wheel"
             assert calls == []
+            async with client.post(
+                runtime.admin_url + "/verify",
+                json={"service": "wheel", "rule": "mock", "count": 1, "statuses": [201]},
+                headers={"Authorization": "Bearer wheel-test"},
+            ) as response:
+                assert response.status == 200
+                verified = await response.json()
+                assert verified["matched"] is True and verified["complete"] is True
+            observed = await admin_command(runtime, "requests", "--service", "wheel")
+            assert [row["status"] for row in observed["requests"]] == [201]
+            verified = await admin_command(
+                runtime,
+                "verify",
+                "--rule",
+                "mock",
+                "--count",
+                "1",
+                "--statuses",
+                "201",
+            )
+            assert verified["matched"] is True and verified["complete"] is True
+            failed = await admin_command(
+                runtime,
+                "verify",
+                "--rule",
+                "mock",
+                "--count",
+                "2",
+                expected=1,
+            )
+            assert failed["matched"] is False and failed["complete"] is True
+            assert (await admin_command(runtime, "reset", "--rule", "mock"))["reset"] == 1
+            checkpoint = (await admin_command(runtime, "journal-clear"))["checkpoint"]
+            await admin_command(runtime, "verify", "--after", checkpoint, "--count", "0")
             reader, writer = await asyncio.open_connection("127.0.0.1", ports[0])
             try:
                 writer.write(
@@ -111,7 +217,10 @@ async def main() -> None:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-    print("Installed wheel: schema, HTTP response, request/response trailer checks passed")
+    print(
+        "Installed wheel: schema, init/validate/explain, admin requests/verify/reset/clear, "
+        "HTTP response, request/response trailer checks passed"
+    )
 
 
 if __name__ == "__main__":

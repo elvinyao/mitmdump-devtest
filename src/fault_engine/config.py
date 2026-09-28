@@ -249,6 +249,7 @@ class LimitsConfig(Model):
     max_connections: int = Field(default=256, ge=1, le=100_000)
     max_inflight_requests: int = Field(default=128, ge=1, le=100_000)
     state_page_size: int = Field(default=1000, ge=1, le=10_000)
+    journal_capacity: int = Field(default=1000, ge=0, le=100_000)
 
 
 class AdminConfig(Model):

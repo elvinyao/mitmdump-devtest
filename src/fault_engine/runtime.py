@@ -21,6 +21,7 @@ from fault_engine.addon import FaultAddon
 from fault_engine.admin import make_admin
 from fault_engine.config import Config
 from fault_engine.engine import Engine
+from fault_engine.journal import Journal
 from fault_engine.limits import ResourceBudget
 from fault_engine.plan import ExecutionPlan, ServicePlan, compile_plan
 from fault_engine.transport import TCPBridge
@@ -38,6 +39,7 @@ class Runtime:
             raise ValueError("admin token must be nonempty printable ASCII without spaces")
         self.config = compile_plan(config)
         self.engine = Engine(self.config)
+        self.journal = Journal(self.config.limits.journal_capacity)
         self.budget = ResourceBudget(
             max_connections=self.config.limits.max_connections,
             max_inflight_requests=self.config.limits.max_inflight_requests,
@@ -46,7 +48,9 @@ class Runtime:
         self.bridges: dict[str, TCPBridge] = {}
         self.master: master.Master | None = None
         self.proxyserver: Proxyserver | None = None
-        self.addon = FaultAddon(self.config, self.engine, self._locate, budget=self.budget)
+        self.addon = FaultAddon(
+            self.config, self.engine, self._locate, budget=self.budget, journal=self.journal
+        )
         self.admin: web.AppRunner | None = None
         self._temp: tempfile.TemporaryDirectory | None = None
         self._lifecycle_lock = asyncio.Lock()
@@ -127,7 +131,7 @@ class Runtime:
             self.bridges[service.id] = bridge
             await bridge.start(service.host, service.port)
         self.admin = web.AppRunner(
-            make_admin(self.config, self.engine, self.token),
+            make_admin(self.config, self.engine, self.token, journal=self.journal),
             access_log=None,
             shutdown_timeout=0.2,
         )

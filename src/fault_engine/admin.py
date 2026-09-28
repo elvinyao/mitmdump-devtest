@@ -3,12 +3,14 @@
 import hmac
 import json
 from collections.abc import Awaitable, Callable
+from typing import Annotated
 
 from aiohttp import web
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 from fault_engine.config import Config, Model
 from fault_engine.engine import Engine
+from fault_engine.journal import Journal
 from fault_engine.plan import ActionPlan, ExecutionPlan
 
 
@@ -16,6 +18,20 @@ class CounterSelection(Model):
     service: str | None = None
     rule: str | None = None
     scope: str | None = None
+
+
+class RequestSelection(CounterSelection):
+    after: str | None = None
+
+
+class Verification(RequestSelection):
+    count: int = Field(ge=0)
+    statuses: list[Annotated[int, Field(ge=100, le=599)]] | None = None
+    min_interval_seconds: float | None = Field(default=None, ge=0)
+
+
+class EmptyBody(Model):
+    pass
 
 
 def _action_summary(action: ActionPlan) -> dict[str, str | int | float]:
@@ -29,8 +45,11 @@ def _action_summary(action: ActionPlan) -> dict[str, str | int | float]:
     return summary
 
 
-def make_admin(config: Config | ExecutionPlan, engine: Engine, token: str) -> web.Application:
+def make_admin(
+    config: Config | ExecutionPlan, engine: Engine, token: str, *, journal: Journal | None = None
+) -> web.Application:
     plan = engine.config
+    observations = journal if journal is not None else Journal(plan.limits.journal_capacity)
 
     @web.middleware
     async def auth(
@@ -122,9 +141,51 @@ def make_admin(config: Config | ExecutionPlan, engine: Engine, token: str) -> we
             }
         )
 
+    async def requests(request: web.Request) -> web.Response:
+        try:
+            if len(request.query) != len(set(request.query)):
+                raise ValueError("duplicate query parameter")
+            query = dict(request.query)
+            raw_limit = query.pop("limit", "100")
+            if not raw_limit.isascii() or not raw_limit.isdecimal():
+                raise ValueError("invalid limit")
+            selection = RequestSelection.model_validate(query)
+            result = observations.page(**selection.model_dump(), limit=int(raw_limit))
+        except ValueError:
+            return web.json_response(
+                {
+                    "error": "expected valid service, rule, scope, after, limit parameters, "
+                    "once each"
+                },
+                status=400,
+            )
+        return web.json_response(result)
+
+    async def clear_requests(request: web.Request) -> web.Response:
+        try:
+            if request.query:
+                raise ValueError("unexpected query parameters")
+            EmptyBody.model_validate(await request.json())
+        except (ValueError, UnicodeDecodeError):
+            return web.json_response({"error": "expected an empty JSON object"}, status=400)
+        return web.json_response({"checkpoint": observations.clear()})
+
+    async def verify(request: web.Request) -> web.Response:
+        try:
+            if request.query:
+                raise ValueError("unexpected query parameters")
+            expectation = Verification.model_validate(await request.json())
+            result = observations.verify(**expectation.model_dump())
+        except (ValueError, UnicodeDecodeError):
+            return web.json_response({"error": "invalid verification parameters"}, status=400)
+        return web.json_response(result)
+
     app = web.Application(middlewares=[auth], client_max_size=4096)
     app.router.add_get("/health", health)
     app.router.add_get("/state", state)
     app.router.add_get("/rules", rules)
     app.router.add_post("/reset", reset)
+    app.router.add_get("/requests", requests)
+    app.router.add_post("/requests/reset", clear_requests)
+    app.router.add_post("/verify", verify)
     return app

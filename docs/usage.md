@@ -47,6 +47,54 @@ bash .agent/run.sh --publish sh -c 'export FAULT_ADMIN_TOKEN="replace-with-your-
 
 此命令只启动代理，不启动演示后端。token 从 YAML 的 `admin.token_env` 指定的环境变量读取，必须是非空、无空格的可打印 ASCII。不要把实际 token 提交到仓库。输出 `event: ready` 后才表示全部监听器已就绪。SIGINT/SIGTERM 会关闭监听器与在途任务。
 
+### 生成配置并完成客户端验收
+
+`init FILE --upstream URL --preset retry|timeout|reset|jitter` 先校验再独占创建 YAML，文件存在时退出 2，不覆盖；配置使用环境变量 token，不包含实际凭证。默认服务 backend、路径 /retry、代理 8080、管理 9090，两者监听容器内 0.0.0.0；可用 `--service`、`--path`、`--port`、`--admin-port` 修改。
+
+| 模板 | 行为 |
+| --- | --- |
+| retry | 同 X-Test-Run-ID 两次 503 后透传；真实后端决定后续状态 |
+| timeout | 每次保持 10 秒不响应，然后终止；客户端更短的读超时可先触发 |
+| reset | 每次重置 TCP 连接；精确 errno 要求容器内直连 |
+| jitter | 每次收到后端响应后等待 50–200 ms；固定 seed 可重放 |
+
+下面在一个 runner 容器中生成临时配置、解释第 1 次请求并启动简单测试后端和代理。先停止占用演示端口的其他进程。在终端一运行（本节 token 是公开演示值）：
+
+```bash
+bash .agent/run.sh --publish sh -lc '
+  set -eu
+  export FAULT_ADMIN_TOKEN=local-demo-token
+  uv run fault-engine init /tmp/retry.yaml --upstream http://127.0.0.1:9000 --preset retry --path /
+  uv run fault-engine validate /tmp/retry.yaml
+  uv run fault-engine explain /tmp/retry.yaml --service backend --path / --header "X-Test-Run-ID: run-1" --ordinal 1
+  uv run python -m http.server 9000 --bind 127.0.0.1 --directory /tmp >/tmp/backend.log 2>&1 &
+  backend_pid=$!
+  trap "kill $backend_pid 2>/dev/null || true" EXIT
+  uv run fault-engine serve /tmp/retry.yaml
+'
+```
+
+看到 `event: ready` 后，在终端二执行一次。先重置序号、清空记录并保存 checkpoint；重复执行整段也应得到 503、503、200：
+
+```bash
+bash .agent/run.sh sh -lc '
+  set -eu
+  export FAULT_ADMIN_TOKEN=local-demo-token
+  admin_url=http://host.docker.internal:19090
+  uv run fault-engine reset --admin-url "$admin_url" --service backend --scope run-1
+  journal_checkpoint=$(uv run fault-engine journal-clear --admin-url "$admin_url" | uv run python -c "import json,sys; print(json.load(sys.stdin)[\"checkpoint\"])")
+  for i in 1 2 3; do
+    curl -sS -o /dev/null -w "%{http_code}\n" -H "X-Test-Run-ID: run-1" http://host.docker.internal:18080/
+  done
+  uv run fault-engine requests --admin-url "$admin_url" --scope run-1 --after "$journal_checkpoint"
+  uv run fault-engine verify --admin-url "$admin_url" --scope run-1 --after "$journal_checkpoint" --count 3 --statuses 503 503 200
+'
+```
+
+把最后一行改为 `--count 2 --statuses 503 503`，应输出 matched=false 且退出 1，可直接让 CI 失败。换成被测客户端时，让客户端 base URL 指向代理、同一次逻辑调用的重试带相同 X-Test-Run-ID，等待客户端完成后再调用 verify。工具按你写出的断言检查观察结果，不推断业务应否重试。
+
+`explain` 不联网、不需要 token、不递增/清理状态；`--ordinal` 是从 1 开始的假定序号，不读取运行中的序号。输出每个候选的 method/path/header/query 失败维度、第一条命中规则、scope 是否有效及实际采样动作，不回显请求头/query 值或响应 body。`--path` 可包含 query；`--header` 可多次使用不同头名，重复普通头需预先按实际代理的合并形式传入。无匹配时 decision=null，实际请求将透传；命中规则但缺少/非法 scope 时诊断退出 2。
+
 ## 2. 配置结构
 
 ```yaml
@@ -67,6 +115,7 @@ limits:
   max_connections: 256
   max_inflight_requests: 128
   state_page_size: 1000
+  journal_capacity: 1000
 body_limit: 10485760
 rules:
   - id: retry-payment
@@ -103,8 +152,9 @@ HTTPS upstream 默认验证证书，系统信任根可直接使用；私有 CA �
 | `limits.max_connections` | 256 | 所有服务共享的公开 TCP 连接上限，包含空闲 keepalive；超限连接立即关闭 |
 | `limits.max_inflight_requests` | 128 | 从收到请求头开始，覆盖上传、上游响应缓冲和故障延迟，直到响应 hook 完成或请求终止 |
 | `limits.state_page_size` | 1000 | `/state` 默认及最大单页条数，查询可通过 limit 选择更小的页 |
+| `limits.journal_capacity` | 1000 | 所有服务共享的最新请求记录条数，0 关闭，最大 100000 |
 
-均为正整数；连接/请求上限最大 100000，单页最大 10000。管理监听器独立于上述数据面配额，因此代理繁忙时仍可查询和重置。`state.capacity` 限制计数条目，`body_limit` 限制单条请求/响应大小；它们与连接及在途请求限额分别生效。
+前三项均为正整数；连接/请求上限最大 100000，状态单页最大 10000。管理监听器独立于上述数据面配额，因此代理繁忙时仍可查询和重置。`state.capacity` 限制计数条目，`body_limit` 限制单条请求/响应大小；它们与连接、在途请求及记录容量限额分别生效。
 
 在途请求超限时，新连接的首个请求无需上传完整 body 就收到 **503 + `X-Fault-Engine-Error: capacity` + `Connection: close`**；HEAD 不返回错误 body。已经处理过请求的 keepalive/管道连接会直接关闭并记录 `capacity_exhausted`，避免把 503 拼进上一条未发送完的响应。被拒请求不访问后端、不消耗场景序号。
 
@@ -192,7 +242,7 @@ HTTPS upstream 默认验证证书，系统信任根可直接使用；私有 CA �
 
 ### 可直接运行的客户端场景
 
-完整演示自动加载 `examples/scenarios.yaml` 的 30 条规则。[场景手册](scenarios.md)集中维护路径、规则 ID、匹配前提、scope 要求和预期结果，另附定向故障、写入重试和循环恢复命令。
+完整演示自动加载 `examples/scenarios.yaml`。[场景手册](scenarios.md)集中维护完整目录、路径、规则 ID、匹配前提、scope 要求和预期结果，另附定向故障、写入重试和循环恢复命令。
 
 引擎只制造场景，不自动判定客户端重试策略是否符合业务要求。演示后端返回的累计调用次数包含其他请求，比较前请记录基线。
 
@@ -240,6 +290,9 @@ bash .agent/run.sh curl -v http://host.docker.internal:18080/reset
 | GET /rules | 规则 ID、服务、scope、起始序号、匹配摘要和动作参数，不暴露 mock body 或 header/query 值 |
 | GET /state | 可选 service/rule/scope、limit/cursor；响应包含 counters，有后续页时另含 next_cursor |
 | POST /reset | JSON 可选 service/rule/scope，返回实际删除的计数条目数 |
+| GET /requests | 请求记录；可选 service/rule/scope/after/limit，返回 requests、checkpoint、complete 和可选 next_cursor |
+| POST /requests/reset | 仅接受 `{}`；全局清空记录并返回 checkpoint，不重置序号 |
+| POST /verify | 精确 count、可选 statuses/min_interval_seconds，加上 service/rule/scope/after；返回 matched、complete、失败原因及实际结果 |
 
 ```bash
 bash .agent/run.sh curl -sS -H 'Authorization: Bearer local-demo-token' http://host.docker.internal:19090/state
@@ -261,6 +314,30 @@ bash .agent/run.sh curl -sS --get -H 'Authorization: Bearer local-demo-token' --
 `/rules` 保留原来的 `actions` 名称数组，另提供 `sequence`：每步包含 action/repeat，以及适用的 status/seconds/delay_seconds。`match` 提供 methods/path/path_regex、header_names/query_names；匹配值以本地 YAML 为准。
 
 `{}` 重置全部。filter 不匹配返回 `{"reset":0}`；过期条目不计入 reset 数量，其物理删除分批进行。错误 JSON、未知字段返回 400，未经认证返回 401，超过 4 KiB 的管理请求体返回 413。重置只影响之后的分配，在途请求保留已选动作。
+
+### 请求记录、窗口与验证
+
+记录从完整请求体到达、场景选择成功时开始，包含未匹配的透传；不包括未完成上传、容量拒绝和场景配置契约错误。每请求一条，按这个进入时间排序；并发完成顺序可能不同。字段包括请求 ID、service/rule/scope/method、ordinal、实际 action/sampled、status/outcome、started_at/duration_seconds 和 upstream_received。不保存路径、query、请求头或 body。scope 完整保存，必须使用非敏感测试 ID；未匹配请求的 rule/scope 为 null，因此带 scope 过滤的验证不会包含它们。
+
+outcome 初始为 pending，终结后不再被后续错误覆盖。response_prepared 表示代理 response hook 完成，不代表客户端收到响应。reset、disconnect、timeout、对应后置动作、client_disconnected、cancelled、shutdown、transport_error 分别表示终结原因；传输故障 status=null，不会伪装成 HTTP 500。reset 执行失败则记录 reset_failed/503。upstream_received 仅证明收到完整后端响应，不证明业务提交。
+
+`/requests` 的 limit 为 1–1000，默认 100，过滤条件按 AND 精确匹配。响应 checkpoint 表示本次读取时的最新 ID，可以在测试开始前保存，用 `after` 查询/验证之后的新请求。next_cursor 表示仍有下一页，把它作为下一次 after 并保持相同过滤；checkpoint 不是下一页游标。请求分页没有固定上界，期间新请求也可能出现，验收前应先等待被测客户端结束。
+
+记录超过容量时淘汰最早的条目；清空不复用 ID。游标绑定当前实例，跨实例、重启后或未来游标返回 400。旧 after 所覆盖的记录被淘汰或清空时，complete=false，即使过滤后恰好只有期望条数也不会通过。省略 after 表示从本次实例开始，已有历史丢失时同样不完整。开始新测试可先记录当前 checkpoint；单人测试也可 journal-clear 后使用它返回的 checkpoint。清空是全局操作，会影响其他测试的证据；并行测试应各自保存起点并用不同 scope。
+
+`verify` 在当前窗口检查精确次数、按进入顺序排列的 HTTP 状态，以及相邻请求进入时间差。count 必须为非负整数；statuses 若提供，长度必须等于 count，每项为 100–599 整数；min_interval_seconds 为有限非负数。断言不符返回 HTTP 200 + matched=false；关闭记录、丢失历史或所选请求仍 pending 时同时 complete=false。返回 failures、incomplete_reasons、pending 及 actual 便于定位。它是即时快照，不会等待未来重试：要验证“取消后没有重试”，调用方须先等待需要观察的窗口结束。
+
+started_at 使用进程单调时钟，仅用于同一实例内比较。**请求进入间隔包含前一次请求的处理耗时，不等于响应结束后的退避等待**；例如 200 ms 慢响应后立即重试，也会满足 100 ms 的进入间隔。当前接口不能证明 Retry-After 遵守、Idempotency-Key 保留或响应后的 backoff；需要客户端/后端专门断言，不能把此项验收结果替代它们。
+
+CLI `requests`、`verify`、`reset`、`journal-clear` 不需要 YAML，默认 `--admin-url http://127.0.0.1:9090`、`--token-env FAULT_ADMIN_TOKEN`。runner 的每次调用都是独立容器，环境变量须在容器内设置；访问另一个已发布代理时使用 `http://host.docker.internal:19090`。真实 token 从指定环境变量读取，不支持明文 token 参数；客户端不跟随重定向、不采用环境代理、总超时 5 秒、响应上限 2 MiB。
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 命令成功；verify 的断言通过且证据完整 |
+| 1 | verify 断言失败或证据不完整 |
+| 2 | 参数、配置、凭证、HTTP、网络或响应格式错误 |
+
+`reset` 只重置之后的场景序号并保留记录；`journal-clear` 全局清空记录但保留序号，也不会停止在途请求。被清除的在途记录后来完成时不会重新插回。重跑同一测试既要处理序号，也要选择新的证据窗口；上面的完整流程同时演示了两种操作。
 
 ## 6. 排查
 

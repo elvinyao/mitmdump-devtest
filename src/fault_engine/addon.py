@@ -13,6 +13,7 @@ from mitmproxy import connection, http
 
 from fault_engine.config import TOKEN, Config
 from fault_engine.engine import Decision, Engine, ScenarioError
+from fault_engine.journal import Journal
 from fault_engine.limits import Lease, ResourceBudget
 from fault_engine.plan import ActionPlan, ExecutionPlan, ServicePlan
 from fault_engine.transport import TCPBridge
@@ -28,6 +29,7 @@ class FaultAddon:
         locate: Callable[[tuple], tuple[ServicePlan, TCPBridge] | None],
         *,
         budget: ResourceBudget | None = None,
+        journal: Journal | None = None,
     ):
         self.config = engine.config
         self.engine = engine
@@ -41,6 +43,9 @@ class FaultAddon:
         self._requests: dict[str, tuple[str, Lease]] = {}
         self._flow_tasks: dict[str, asyncio.Task] = {}
         self._seen_clients: set[str] = set()
+        self.journal = (
+            journal if journal is not None else Journal(self.config.limits.journal_capacity)
+        )
 
     @staticmethod
     def _event(flow: http.HTTPFlow, phase: str, result: str) -> None:
@@ -88,6 +93,8 @@ class FaultAddon:
             self.pending.discard(task)
 
     async def close(self) -> None:
+        for flow_id in self._requests:
+            self.journal.finish(flow_id, "shutdown")
         pending = list(self.pending)
         for task in pending:
             task.cancel()
@@ -148,6 +155,7 @@ class FaultAddon:
         for flow_id, (client_id, _) in list(self._requests.items()):
             if client_id != client.id:
                 continue
+            self.journal.finish(flow_id, "client_disconnected")
             task = self._flow_tasks.get(flow_id)
             if task is not None and not task.done():
                 task.cancel()
@@ -177,7 +185,9 @@ class FaultAddon:
             if found is None or not found[1].reset(flow.client_conn.peername):
                 self._problem(flow, 503, "TCP reset failed: connection mapping unavailable")
                 self._event(flow, "fault", "reset_failed")
+                self.journal.finish(flow.id, "reset_failed", status=503)
                 return False
+        self.journal.finish(flow.id, action.action)
         flow.kill()
         self._event(flow, "fault", action.action)
         return True
@@ -190,7 +200,11 @@ class FaultAddon:
         self._flow_tasks[flow.id] = task
         try:
             await self._request(flow)
-        except BaseException:
+        except BaseException as exc:
+            self.journal.finish(
+                flow.id,
+                "cancelled" if isinstance(exc, asyncio.CancelledError) else "internal_error",
+            )
             self._release_request(flow.id)
             raise
         finally:
@@ -226,6 +240,16 @@ class FaultAddon:
             self._problem(flow, 400, str(exc))
             self._event(flow, "request", "scenario_error")
             return
+        self.journal.start(
+            flow.id,
+            service=service.id,
+            rule=decision.rule_id if decision else None,
+            scope=decision.scope if decision else None,
+            method=method,
+            ordinal=decision.ordinal if decision else None,
+            action=decision.action.action if decision else "passthrough",
+            sampled=decision.sampled if decision else None,
+        )
         url = urlsplit(service.upstream)
         flow.request.scheme = url.scheme
         flow.request.host = url.hostname or ""
@@ -245,6 +269,7 @@ class FaultAddon:
             assert action.seconds is not None
             await self._sleep(action.seconds)
             if action.action == "timeout":
+                self.journal.finish(flow.id, "timeout")
                 flow.kill()
                 self._event(flow, "request", "hold_expired")
         elif action.action in {"reset", "disconnect"}:
@@ -256,12 +281,20 @@ class FaultAddon:
         self._flow_tasks[flow.id] = task
         try:
             await self._response(flow)
+        except BaseException as exc:
+            self.journal.finish(
+                flow.id,
+                "cancelled" if isinstance(exc, asyncio.CancelledError) else "internal_error",
+            )
+            raise
         finally:
             self._flow_tasks.pop(flow.id, None)
             self._release_request(flow.id)
 
     async def _response(self, flow: http.HTTPFlow) -> None:
         decision: Decision | None = flow.metadata.get("fault_decision")
+        if flow.response is not None and (decision is None or decision.action.action != "respond"):
+            self.journal.mark_upstream(flow.id)
         if decision:
             action = decision.action
             if action.action in {"delay_after", "respond_after", "reset_after", "disconnect_after"}:
@@ -280,7 +313,13 @@ class FaultAddon:
         self._event(
             flow, "response", str(flow.response.status_code) if flow.response else "missing"
         )
+        self.journal.finish(
+            flow.id,
+            "response_prepared" if flow.response else "missing_response",
+            status=flow.response.status_code if flow.response else None,
+        )
 
     def error(self, flow: http.HTTPFlow) -> None:
+        self.journal.finish(flow.id, "transport_error")
         self._release_request(flow.id)
         self._event(flow, "error", "transport_error")

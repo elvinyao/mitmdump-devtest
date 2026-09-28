@@ -87,20 +87,9 @@ class Engine:
         normalized = {k.lower(): v for k, v in headers.items()}
         pairs = set(query)
         for rule in self._rules.get(service, []):
-            match = rule.match
-            if match.methods is not None and method not in match.methods:
+            if self._match_failures(rule, method, path, normalized, pairs):
                 continue
-            if match.path is not None and path != match.path:
-                continue
-            if match.pattern is not None and not match.pattern.fullmatch(path):
-                continue
-            if any(normalized.get(k) != v for k, v in match.headers.items()):
-                continue
-            if any((k, v) not in pairs for k, v in match.query.items()):
-                continue
-            scope = "global" if rule.scope == "global" else normalized.get(rule.scope.lower(), "")
-            if not scope or len(scope) > 256 or any(ord(ch) < 32 for ch in scope):
-                raise ScenarioError("missing or invalid scope header (maximum 256 characters)")
+            scope = self._scope(rule, normalized)
             now = self._clock()
             self._expire(now)
             key = (service, rule.id, scope)
@@ -121,23 +110,107 @@ class Engine:
             counter.count += 1
             counter.touched = now
             self._counters.move_to_end(key)
-            action = self._select(rule, counter.count)
-            sampled = rule.probability == 1 or (
-                rule.probability > 0
-                and self._fraction(rule, scope, counter.count, "probability") < rule.probability
-            )
-            if not sampled:
-                action = PASSTHROUGH
-            elif action.jitter_seconds:
-                extra = action.jitter_seconds * self._fraction(rule, scope, counter.count, "delay")
-                action = replace(
-                    action,
-                    seconds=action.seconds + extra if action.seconds is not None else None,
-                    delay_seconds=action.delay_seconds + extra if action.status is not None else 0,
-                    jitter_seconds=0,
-                )
-            return Decision(service, rule.id, scope, counter.count, action, sampled)
+            return self._decision(rule, scope, counter.count)
         return None
+
+    @staticmethod
+    def _match_failures(
+        rule: RulePlan,
+        method: str,
+        path: str,
+        headers: Mapping[str, str],
+        query: set[tuple[str, str]],
+    ) -> list[str]:
+        """Describe failed dimensions without including request or configured values."""
+        match = rule.match
+        failures = []
+        if match.methods is not None and method not in match.methods:
+            failures.append("method")
+        if (match.path is not None and path != match.path) or (
+            match.pattern is not None and not match.pattern.fullmatch(path)
+        ):
+            failures.append("path")
+        if any(headers.get(k) != v for k, v in match.headers.items()):
+            failures.append("header")
+        if any((k, v) not in query for k, v in match.query.items()):
+            failures.append("query")
+        return failures
+
+    @staticmethod
+    def _scope(rule: RulePlan, headers: Mapping[str, str]) -> str:
+        scope = "global" if rule.scope == "global" else headers.get(rule.scope.lower(), "")
+        if not scope or len(scope) > 256 or any(ord(ch) < 32 for ch in scope):
+            raise ScenarioError("missing or invalid scope header (maximum 256 characters)")
+        return scope
+
+    def _decision(self, rule: RulePlan, scope: str, ordinal: int) -> Decision:
+        """Select and sample at a given position without reading or changing state."""
+        action = self._select(rule, ordinal)
+        sampled = rule.probability == 1 or (
+            rule.probability > 0
+            and self._fraction(rule, scope, ordinal, "probability") < rule.probability
+        )
+        if not sampled:
+            action = PASSTHROUGH
+        elif action.jitter_seconds:
+            extra = action.jitter_seconds * self._fraction(rule, scope, ordinal, "delay")
+            action = replace(
+                action,
+                seconds=action.seconds + extra if action.seconds is not None else None,
+                delay_seconds=action.delay_seconds + extra if action.status is not None else 0,
+                jitter_seconds=0,
+            )
+        return Decision(rule.service, rule.id, scope, ordinal, action, sampled)
+
+    def explain(
+        self,
+        service: str,
+        method: str,
+        path: str,
+        headers: Mapping[str, str],
+        query: Sequence[tuple[str, str]],
+        ordinal: int = 1,
+    ) -> dict:
+        """Explain a hypothetical request without counters, expiry, clock, or network I/O.
+
+        Header and query values, including the test scope, are never returned.
+        Response bodies and headers are omitted from the selected action as well.
+        """
+        if service not in self._rules:
+            raise ValueError("unknown service")
+        if type(ordinal) is not int or ordinal < 1:
+            raise ValueError("ordinal must be a positive integer")
+        normalized = {k.lower(): v for k, v in headers.items()}
+        pairs = set(query)
+        candidates = []
+        selected = None
+        for rule in self._rules[service]:
+            failures = self._match_failures(rule, method, path, normalized, pairs)
+            candidates.append({"rule": rule.id, "matches": not failures, "failures": failures})
+            if not failures and selected is None:
+                selected = rule
+        result = {"matched_rule": None, "candidates": candidates, "scope": None, "decision": None}
+        if selected is None:
+            return result
+        result["matched_rule"] = selected.id
+        try:
+            scope = self._scope(selected, normalized)
+        except ScenarioError as exc:
+            result["scope"] = {"valid": False, "error": str(exc)}
+            return result
+        decision = self._decision(selected, scope, ordinal)
+        result["scope"] = {"valid": True}
+        result["decision"] = {
+            "service": decision.service,
+            "rule": decision.rule_id,
+            "ordinal": decision.ordinal,
+            "action": decision.action.action,
+            "status": decision.action.status,
+            "seconds": decision.action.seconds,
+            "delay_seconds": decision.action.delay_seconds,
+            "sampled": decision.sampled,
+        }
+        return result
 
     @staticmethod
     def _fraction(rule: RulePlan, scope: str, ordinal: int, channel: str) -> float:
