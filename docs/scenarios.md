@@ -1,18 +1,77 @@
 # 场景手册
 
-新增三个按 seed 重放的场景，均需 `X-Test-Run-ID`：
-
-| 路径 | 行为 |
-| --- | --- |
-| `/sampled-unavailable` | 约 25% 返回 503，其余透传；seed=42 |
-| `/latency-jitter` | 完整后端响应后额外等待 50–200 ms |
-| `/occasional-slow` | 约 5% 在完整后端响应后额外等待 1–2 秒 |
-
-比例是概率，不是每批的精确配额；同 ID reset 后重放，新 ID 改变样本。参见 [模式调研](fault-patterns.md)。
-
 先按 [README](../README.md) 启动完整演示，再从另一终端执行下面的 runner 命令。所有规则来自 [scenarios.yaml](../examples/scenarios.yaml)；除 inventory `/cycle` 使用宿主机端口 18081，其余使用 18080。
 
 表中的“后端”表示真实透传，演示后端返回 200；接入真实服务后不保证成功。“测试 ID”表示必须携带 `X-Test-Run-ID`，同一逻辑调用的重试保持相同 ID，不同测试使用不同 ID。未标注的规则使用 `global` 计数。
+
+## 先验证最初需要的四类场景
+
+| 要验证的行为 | 演示入口 | 关键设置 / 结果 |
+| --- | --- | --- |
+| 两次 4xx 后第三次固定 OK | orders `/mock` | `respond: 400` × 2，再 `respond: 200`；不访问后端 |
+| 第 n 次才发生故障 | orders `/nth`，测试 ID | `start_at: 5`，第 5、6 次 503；其他次数访问后端 |
+| 两次错误后恢复真实调用 | orders `/retry`，测试 ID | 两次 429，再 passthrough；第三次由后端决定 |
+| 响应超时、HTTP 4xx/5xx | orders `/timeout`、`/unauthorized`、`/always-unavailable`、`/gateway-timeout` | 分别是读超时、401、503、504；按错误类型验收客户端 |
+
+多后端接入的完整 YAML 和客户端 base URL 对应表见[接入真实后端](usage.md#接入真实后端)。以下固定次数的 curl 调用用于检查代理是否按配置制造场景；实际客户端的 retry/error handling 验收见[客户端验收](usage.md#客户端重试与错误处理验收)。
+
+### 两次 400 后固定 200
+
+`/mock` 使用全局计数。先精确重置该规则，再保存只读 checkpoint；以下整段可重复执行，不清空其他测试的请求记录。同一时间不要让其他客户端访问 `/mock`，否则它们也会占用这条规则的次数。
+
+```bash
+bash .agent/run.sh sh -lc '
+  set -eu
+  export FAULT_ADMIN_TOKEN=local-demo-token
+  admin_url=http://host.docker.internal:19090
+  uv run fault-engine reset --admin-url "$admin_url" --service orders --rule fixed-success
+  journal_checkpoint=$(uv run fault-engine requests --admin-url "$admin_url" --limit 1 | uv run python -c "import json,sys; print(json.load(sys.stdin)[\"checkpoint\"])")
+  for i in 1 2 3 4; do
+    curl -sS --max-time 5 -o /dev/null -w "%{http_code}\n" http://host.docker.internal:18080/mock
+  done
+  uv run fault-engine verify --admin-url "$admin_url" --service orders --rule fixed-success --after "$journal_checkpoint" --count 4 --statuses 400 400 200 200
+'
+```
+
+最后一行应返回 `matched: true`、`complete: true`，退出 0。第三次及以后固定返回 `{"ok":true}`；整个序列不调用后端。`after_sequence: repeat_last` 保持最后一步的 200。要并行运行自己的这一场景，在复制的 YAML 中给该规则加 `scope: X-Test-Run-ID`，请求和 reset/verify 使用各自的测试 ID；仅给现有全局规则发送请求头不会隔离计数。
+
+400 是为复现精确的“两次 4xx”而设置。实际客户端通常应在第一次不可重试的 400 后停止；不能为了看到第三步而自动重试全部 4xx。需要验证可重试的 4xx 时选 `/retry` 的 429。
+
+### 第 5、6 次 503，其余访问后端
+
+```bash
+bash .agent/run.sh sh -lc '
+  set -eu
+  export FAULT_ADMIN_TOKEN=local-demo-token
+  admin_url=http://host.docker.internal:19090
+  uv run fault-engine reset --admin-url "$admin_url" --service orders --rule nth-error --scope nth-manual
+  journal_checkpoint=$(uv run fault-engine requests --admin-url "$admin_url" --limit 1 | uv run python -c "import json,sys; print(json.load(sys.stdin)[\"checkpoint\"])")
+  for i in 1 2 3 4 5 6 7; do
+    curl -sS --max-time 5 -o /dev/null -w "%{http_code}\n" -H "X-Test-Run-ID: nth-manual" http://host.docker.internal:18080/nth
+  done
+  uv run fault-engine verify --admin-url "$admin_url" --service orders --rule nth-error --scope nth-manual --after "$journal_checkpoint" --count 7 --statuses 200 200 200 200 503 503 200
+'
+```
+
+演示后端收到 5 次请求。改 YAML 的 `start_at` 可选择第 n 次，改步骤的 `repeat` 可选择连续故障次数；`repeat` 不会让代理内部重试。真实后端不一定返回 200，因此接入后应按业务预期更改验收状态。
+
+### 区分读超时与 HTTP 504
+
+以下将预期错误转成可自动判断的断言：第一条 curl 应在 1 秒内等不到响应而退出 28；第二条正常收到 HTTP 504，curl 本身退出 0。
+
+```bash
+bash .agent/run.sh sh -lc '
+  set -eu
+  curl -sS --max-time 1 -o /dev/null http://host.docker.internal:18080/timeout && result=0 || result=$?
+  test "$result" -eq 28
+  printf "read timeout: curl exit %s\n" "$result"
+  status=$(curl -sS --max-time 5 -o /dev/null -w "%{http_code}" http://host.docker.internal:18080/gateway-timeout)
+  test "$status" = 504
+  printf "HTTP response: %s\n" "$status"
+'
+```
+
+这里不用 `--fail`，以便区分 HTTP 响应与传输错误。仅看到 curl 28 仍不足以判断故障配置是否命中；结合日志/requests 确认选中的 action 为 timeout。该动作不访问后端；`/slow-after` 则先获得后端响应再延迟，用于不同的写入风险测试。
 
 ## 选择场景
 
@@ -62,6 +121,16 @@
 | cached-resource | GET/HEAD `/cached`，`If-None-Match: "demo-v1"` | 304 + ETag，无 body；其他条件透传 |
 | delete-no-content | DELETE `/no-content` | 204，无 body；其他方法透传 |
 | binary-download | GET/HEAD `/binary` | GET 返回字节 `00 01 ff 80`；HEAD 无 body，Content-Length 为 4 |
+
+### 按 seed 重放的比例和延迟
+
+下面三条均需测试 ID。比例是概率，不是每批的精确配额；同 ID reset 后重放，新 ID 改变样本。要求精确次数时使用前面的 sequence 场景。参见 [模式调研](fault-patterns.md)。
+
+| 规则 ID | 路径 | 行为 |
+| --- | --- | --- |
+| sampled-unavailable | `/sampled-unavailable` | 约 25% 返回 503，其余透传；seed=42 |
+| latency-jitter | `/latency-jitter` | 完整后端响应后额外等待 50–200 ms |
+| occasional-slow-response | `/occasional-slow` | 约 5% 在完整后端响应后额外等待 1–2 秒 |
 
 ## 定向故障与单次测试重跑
 

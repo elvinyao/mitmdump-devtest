@@ -1,5 +1,9 @@
 # 使用文档
 
+第一次使用可先按 [README](../README.md) 启动两个演示后端，然后按[核心场景步骤](scenarios.md#先验证最初需要的四类场景)复现“两次 4xx 后固定成功”、第 n 次故障、读超时和 5xx。接入自己的系统时，先改各服务的 base URL，再选匹配规则；客户端是否自动重试、重试几次，仍由客户端决定。
+
+本文按运行、配置、匹配计数、故障动作、管理验收和排查说明完整用法。无需通过阅读源码开始配置。
+
 ## 1. 运行方式
 
 所有执行命令使用 `bash .agent/run.sh ...`。runner 将本项目挂载到容器 `/workspace`，使用 Python 3.12，自动引导固定版本 uv；虚拟环境放在 `.venv-docker`，uv 下载缓存使用 Docker volume。依赖由 `uv.lock` 锁定。
@@ -39,13 +43,65 @@ runner 不带 `--publish` 时不发布任何端口，适用于测试。端口映
 
 ### 接入真实后端
 
-复制并编辑场景 YAML，将 `services[*].upstream` 改成真实服务的 origin。容器内的 `127.0.0.1` 指容器自身。在 Docker Desktop/OrbStack 中访问宿主机后端可使用 `http://host.docker.internal:9000`；Linux 原生 Docker 的宿主机地址需要按其网络配置填写。
+假设两个真实后端已经分别监听宿主机 9000、9001。将以下完整配置保存为仓库根目录的 `my-backends.yaml`，并把匹配路径换成业务实际使用的路径。代理不会启动这些后端。
 
-```bash
-bash .agent/run.sh --publish sh -c 'export FAULT_ADMIN_TOKEN="replace-with-your-local-token"; uv run fault-engine serve examples/scenarios.yaml'
+```yaml
+version: 1
+services:
+  - id: orders
+    host: 0.0.0.0
+    port: 8080
+    upstream: http://host.docker.internal:9000
+  - id: inventory
+    host: 0.0.0.0
+    port: 8081
+    upstream: http://host.docker.internal:9001
+admin:
+  host: 0.0.0.0
+  port: 9090
+  token_env: FAULT_ADMIN_TOKEN
+rules:
+  - id: orders-retry
+    service: orders
+    match: {path: /api/orders, methods: [GET]}
+    scope: X-Test-Run-ID
+    sequence:
+      - action: respond
+        status: 429
+        repeat: 2
+        headers: {Retry-After: '1'}
+        json_body: {error: retry_later}
+    after_sequence: passthrough
+  - id: inventory-timeout
+    service: inventory
+    match: {path: /api/items, methods: [GET]}
+    scope: X-Test-Run-ID
+    sequence:
+      - action: timeout
+        seconds: 10
+    after_sequence: repeat_last
 ```
 
-此命令只启动代理，不启动演示后端。token 从 YAML 的 `admin.token_env` 指定的环境变量读取，必须是非空、无空格的可打印 ASCII。不要把实际 token 提交到仓库。输出 `event: ready` 后才表示全部监听器已就绪。SIGINT/SIGTERM 会关闭监听器与在途任务。
+| 客户端配置 | 原本直接访问的后端 | 改为宿主机代理入口 | 从另一个 runner 容器访问 |
+| --- | --- | --- | --- |
+| orders base URL | `http://127.0.0.1:9000` | `http://127.0.0.1:18080` | `http://host.docker.internal:18080` |
+| inventory base URL | `http://127.0.0.1:9001` | `http://127.0.0.1:18081` | `http://host.docker.internal:18081` |
+
+例如客户端原本请求 `http://127.0.0.1:9000/api/orders?limit=10`，现在请求 `http://127.0.0.1:18080/api/orders?limit=10`，并携带 `X-Test-Run-ID: order-test-1`。同 ID 前两次为 429，第三次访问真实 orders 后端；真实后端决定第三次的状态与 body。inventory 的匹配请求保持 10 秒不响应，客户端读超时应小于 10 秒。其他路径、方法正常透传。
+
+```bash
+bash .agent/run.sh uv run fault-engine validate my-backends.yaml
+bash .agent/run.sh uv run fault-engine explain my-backends.yaml --service orders --path /api/orders --header 'X-Test-Run-ID: order-test-1' --ordinal 3
+bash .agent/run.sh --publish sh -c 'export FAULT_ADMIN_TOKEN="replace-with-your-local-token"; uv run fault-engine serve my-backends.yaml'
+```
+
+启动前停止占用相同端口的演示。token 从 YAML 的 `admin.token_env` 指定的环境变量读取，必须是非空、无空格的可打印 ASCII；将命令中的演示占位值换成本地 token，不要提交到仓库。输出 `event: ready` 后表示全部代理监听器已就绪；它不检查真实后端是否可用。SIGINT/SIGTERM 会关闭监听器与在途任务。
+
+客户端通常只需更改每个服务的 base URL，不需要配置 `HTTP_PROXY`。一个 `services` 条目对应一个固定 upstream 和一个监听端口，路由由客户端连接的端口决定。路径和 query 不变，Host 改成 upstream；`upstream` 只能填 origin，不能填 `/api` 这类路径前缀。需要保留 API 前缀时，将前缀留在客户端请求路径中。
+
+容器内的 `127.0.0.1` 指容器自身；`examples/scenarios.yaml` 中的该地址仅适合与演示后端在同一容器运行。在 Docker Desktop/OrbStack 中访问宿主机后端可使用 `host.docker.internal`；宿主机后端仍须监听 Docker 可达的地址。Linux 原生 Docker 需要按实际网络填写可达地址，也需相应替换手册里的 `host.docker.internal` 客户端地址。后端位于另一台开发服务器时，直接填写容器可访问的服务器 origin。
+
+增加第三个服务时，在 YAML 增加唯一 id、端口和 upstream；若要从宿主机访问，也要在 `.agent/run.sh` 的 `PORTS` 中增加映射，例如 `127.0.0.1:18082:8082`。现有 `--publish` 只发布 8080、8081、9090；单独修改 `init --port` 或 YAML 不会自动增加发布端口。
 
 ### 生成配置并完成客户端验收
 
@@ -74,7 +130,7 @@ bash .agent/run.sh --publish sh -lc '
 '
 ```
 
-看到 `event: ready` 后，在终端二执行一次。先重置序号、清空记录并保存 checkpoint；重复执行整段也应得到 503、503、200：
+看到 `event: ready` 后，在终端二执行一次。先重置序号、清空记录并保存 checkpoint；重复执行整段也应得到 503、503、200。此处是单人临时演示，清空记录是全局操作；共享实例请使用下文的只读 checkpoint 方式：
 
 ```bash
 bash .agent/run.sh sh -lc '
@@ -91,9 +147,77 @@ bash .agent/run.sh sh -lc '
 '
 ```
 
-把最后一行改为 `--count 2 --statuses 503 503`，应输出 matched=false 且退出 1，可直接让 CI 失败。换成被测客户端时，让客户端 base URL 指向代理、同一次逻辑调用的重试带相同 X-Test-Run-ID，等待客户端完成后再调用 verify。工具按你写出的断言检查观察结果，不推断业务应否重试。
+把最后一行改为 `--count 2 --statuses 503 503`，应输出 matched=false 且退出 1，可直接让 CI 失败。这里的 `for` 循环固定发送三次请求，只验证代理序列；要验证真实重试策略，应只调用一次被测客户端，让它决定是否继续发送请求。将其 base URL 指向代理，同一次逻辑调用的重试带相同 X-Test-Run-ID，等待客户端完成后再调用 verify。工具按你写出的断言检查观察结果，不推断业务应否重试。
 
 `explain` 不联网、不需要 token、不递增/清理状态；`--ordinal` 是从 1 开始的假定序号，不读取运行中的序号。输出每个候选的 method/path/header/query 失败维度、第一条命中规则、scope 是否有效及实际采样动作，不回显请求头/query 值或响应 body。`--path` 可包含 query；`--header` 可多次使用不同头名，重复普通头需预先按实际代理的合并形式传入。无匹配时 decision=null，实际请求将透传；命中规则但缺少/非法 scope 时诊断退出 2。
+
+### 客户端重试与错误处理验收
+
+代理能记录客户端实际发送了几次请求以及每次选择的动作。业务是否成功、最终展示什么错误、异常是否被正确归类，需要在被测客户端或业务测试中断言。开始前明确最大尝试次数（包含首次调用）、可重试状态/异常、读超时、总截止时间、退避策略，以及允许重试的方法。不要把“最多重试两次”和“最多尝试两次”混用。
+
+| 客户端测试 | 使用的演示场景 | 代理侧证据 | 客户端 / 业务侧断言 |
+| --- | --- | --- | --- |
+| 暂时限流后成功 | `/retry`，测试 ID | 策略允许 429 且最多尝试 3 次时，应为 429、429、200 | 一次调用最终成功；body 正确；验证响应结束后实际等待时间及 Retry-After 策略 |
+| 重试预算耗尽 | `/always-unavailable`，global | 最多尝试 3 次时，应恰好有 3 条 503 | 抛出约定错误或显示失败；总耗时不超预算；不会后台继续发送 |
+| 不可重试 HTTP 错误 | `/unauthorized`，global | 对不刷新凭证、不重试 401 的策略，应恰好 1 条 401 | 保留状态/错误信息，按产品要求提示登录或失败；不进入重试循环 |
+| 读超时后恢复 | `/mixed-retry`，测试 ID | 先 timeout，再 503、200；第一条 status 为 null，查询 action/outcome | 读超时被正确分类；允许重试时最终成功；截止时间仍有效 |
+| 固定成功序列 | `/mock`，global | 人工发送三次为 400、400、200；真实客户端是否到第三次由策略决定 | 第一次 400 如果不可重试，应直接失败；固定 200 的 body 不是业务后端结果 |
+| 响应解析/业务失败 | `/invalid-json`、`/empty-json`、`/business-error` | HTTP 状态均为 200 | JSON 解析错误或 `ok:false` 不应被当成成功；是否重试由业务约定决定 |
+| 后端已执行但确认丢失 | POST `/write-then-error`、`/write-then-reset`，测试 ID | 后置动作及 upstream_received；查询实际发送次数 | 检查后端业务记录和同一幂等键，保证重试没有重复写入；不能只靠 HTTP 状态判断 |
+
+重跑流程如下，适用于 curl、下面的参考客户端以及你自己的 SDK / 应用：
+
+1. 等上一轮客户端与在途请求结束，再按 service/rule/scope 精确 reset。它只重置之后的序号，不清除记录、不取消在途请求。global 规则不能靠更换测试 ID 隔离，需独占该规则或将自定义配置改成 header scope。
+2. 在触发调用前读取 `requests` 返回的 checkpoint，保存为本轮起点。查询可以带 `--limit 1`；checkpoint 是当前实例的最新 ID，不是那一页最后一条 ID。这样不用执行会影响所有人的 `journal-clear`。
+3. 只触发一次被测客户端的逻辑调用，由客户端自己根据响应和异常重试。重试复用相同测试 ID，新的并行用例使用不同 ID。
+4. 等客户端结束，再对相同 service/rule/scope 和 `--after` 起点执行 verify。要证明取消后或预算耗尽后没有额外请求，还应等待约定的观察窗口结束再验收；verify 不会替你等待。
+5. 同时断言客户端的最终结果、异常类别、返回数据或页面错误状态。精确退避需比较上次响应结束与下次发送的时间；verify 的请求进入间隔包含上次处理耗时，不能替代该断言。
+
+发生读超时或断连时，请求记录的 status 为 null；`verify --statuses` 只接受整数 HTTP 状态，不能写 0/null 代替异常。可用 verify 检查精确 count，再用 requests 与客户端异常断言检查动作和结局。如果仍有 pending、记录被淘汰或关闭记录，verify 会失败；先等待有限的故障动作结束或客户端断开被处理，再读取证据，不能忽略 complete=false。
+
+#### 可运行的 GET 重试客户端
+
+[examples/retry_client.py](../examples/retry_client.py) 演示一次逻辑调用中的真实重试决策：只重试 429、503 和读超时，最多尝试 3 次，2xx 成功即停，其他 HTTP 状态、其他传输错误或响应解码错误立即结束。每次重试前固定等待 `--retry-delay` 秒；`--max-attempts` 包含第一次调用。未指定 `--run-id` 时生成新 ID，同一次调用的全部尝试复用它。
+
+该示例只发送 GET，不解析 Retry-After、不解析业务 body，也不提供总截止时间。`--timeout` 是 HTTPX 各网络操作的超时，不是整个逻辑调用的时间预算；需要总截止时间或幂等写入策略时，应在自己的客户端中实现并另外断言。这是可读的参考实现，不能代替对实际 SDK / 应用的测试。
+
+保持完整演示运行，在另一终端执行以下整段。它不清空请求记录；两条 global 规则在验收期间需要独占使用。预期失败用例的退出 1 会被显式检查，参数/连接环境等意外问题仍会让这段验收失败。
+
+```bash
+bash .agent/run.sh sh -lc '
+  set -eu
+  export FAULT_ADMIN_TOKEN=local-demo-token
+  admin_url=http://host.docker.internal:19090
+  orders_url=http://host.docker.internal:18080
+  uv run fault-engine reset --admin-url "$admin_url" --service orders --rule retry-twice --scope client-ok
+  uv run fault-engine reset --admin-url "$admin_url" --service orders --rule retry-budget
+  uv run fault-engine reset --admin-url "$admin_url" --service orders --rule authentication-required
+  uv run fault-engine reset --admin-url "$admin_url" --service orders --rule mixed-retry --scope client-mixed
+  journal_checkpoint=$(uv run fault-engine requests --admin-url "$admin_url" --limit 1 | uv run python -c "import json,sys; print(json.load(sys.stdin)[\"checkpoint\"])")
+
+  uv run python examples/retry_client.py "$orders_url/retry" --run-id client-ok
+  uv run fault-engine verify --admin-url "$admin_url" --service orders --rule retry-twice --scope client-ok --after "$journal_checkpoint" --count 3 --statuses 429 429 200
+
+  expect_client_failure() {
+    "$@" && result=0 || result=$?
+    test "$result" -eq 1
+  }
+  expect_client_failure uv run python examples/retry_client.py "$orders_url/always-unavailable" --run-id client-budget --retry-delay 0.1
+  uv run fault-engine verify --admin-url "$admin_url" --service orders --rule retry-budget --after "$journal_checkpoint" --count 3 --statuses 503 503 503
+
+  expect_client_failure uv run python examples/retry_client.py "$orders_url/unauthorized" --run-id client-auth
+  uv run fault-engine verify --admin-url "$admin_url" --service orders --rule authentication-required --after "$journal_checkpoint" --count 1 --statuses 401
+
+  uv run python examples/retry_client.py "$orders_url/mixed-retry" --run-id client-mixed --timeout 0.5 --retry-delay 0.1
+  sleep 3
+  uv run fault-engine verify --admin-url "$admin_url" --service orders --rule mixed-retry --scope client-mixed --after "$journal_checkpoint" --count 3
+  uv run fault-engine requests --admin-url "$admin_url" --service orders --rule mixed-retry --scope client-mixed --after "$journal_checkpoint"
+'
+```
+
+客户端输出 JSON，包含 run_id、按尝试顺序列出的 attempts、最终 outcome；每次尝试含 number、status 和 outcome。四次逻辑调用的最终 outcome 应分别为 `success`、`retry_exhausted`、`http_error`、`success`；混合场景的 attempts 应为 `read_timeout` / null、`http` / 503、`http` / 200。sleep 用于让混合场景中最长 3 秒的不响应动作有时间终结，随后再检查完整记录。
+
+示例客户端成功退出 0，HTTP/重试耗尽/传输失败/响应解码失败退出 1，参数错误退出 2；响应解码失败的 outcome 为 `decode_error`。它不会调用管理 API 或修改计数；本段前置的 reset/checkpoint 负责重跑。替换成自己的客户端后保留相同的证据流程，并按实际策略修改预期次数和结果。
 
 ## 2. 配置结构
 
@@ -175,6 +299,8 @@ HTTPS upstream 默认验证证书，系统信任根可直接使用；私有 CA �
 - 所有配置中的 scope 控制头默认在转发前删除，包括未匹配请求。禁止使用 Authorization/Cookie/Host 等保留头作为 scope。
 
 序号从 1 开始，先分配再执行延迟。并发请求按进入引擎的顺序分配，不保证按响应完成顺序递增。请求取消仍消耗已分配序号。
+
+仅精确的 `HEAD` 使用无响应 body 的语义；`head`、`hEaD` 属于不同的自定义方法，保留原始方法转发。当前锁定的 mitmproxy 需要兼容适配：这类自定义方法的普通 chunked 响应在完整缓冲后改用 Content-Length；若有 body 的上游响应采用 `gzip,chunked` 等复合 Transfer-Encoding，则明确返回 502，避免丢失编码信息。该限制不影响一般 GET/POST，也不同于常规的 `Content-Encoding: gzip` 压缩响应。
 
 `path_regex` 最长 4096 字符，使用非回溯的 Rust regex 引擎；环视、反向引用及不兼容语法在 `validate` 时拒绝，错误信息不会回显表达式。原来依赖这些 Python `re` 特性的配置需要改写；路径、方法、header/query 组合通常可以表达相同的测试条件。引擎仍按同步步骤分配计数，不把危险匹配丢入无法取消的后台线程。语法依据见 [Pydantic regex engine](https://pydantic.dev/docs/validation/latest/api/pydantic/config/#regex_engine)。
 

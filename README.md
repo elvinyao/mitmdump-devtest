@@ -1,17 +1,17 @@
 # Fault Engine
 
-基于 **mitmproxy** 的开发测试反向代理。客户端更改 base URL，即可复现错误序列、响应超时、断连和真实 TCP Reset，检查 retry / error handling。
+基于 **mitmproxy** 的开发测试反向代理。把客户端各后端服务的 base URL 改为对应代理端口，用 YAML 制造故障，再检查客户端的重试、异常分类和最终结果。未命中规则的请求正常转发，不需要修改后端业务代码。
 
-- 多后端、多监听端口，未匹配请求正常转发。
-- 支持 GET、POST、PUT、PATCH、DELETE、HEAD、OPTIONS、TRACE 和合法自定义 HTTP 方法。
-- 支持 `429 → 429 → 真实后端`、第 n 次开始失败、循环场景和固定 mock 响应。
-- 按测试请求头隔离计数，管理 API 查询状态和重置。
-- Linux Docker 中验证真实 `ECONNRESET`（errno 104），与 HTTP 504、普通断连分别测试。
-- 支持后端已执行后再返回错误或断连，验证写入重试与幂等性；附带 33 条可运行场景。
-- 支持固定 seed 的故障采样与延迟抖动，reset 后可重放，不同 scope 不共享随机数状态。
-- 提供条件匹配、维护窗口豁免、循环恢复、缓存 304、DELETE 204 和二进制下载示例。
-- 使用非回溯正则和只读执行计划；连接与在途请求可设上限，管理状态支持分页。
-- `init` 生成配置，`explain` 离线解释匹配；`requests` 查看脱敏记录，`verify` 为 CI 检查请求次数、状态序列和进入间隔。
+| 你要测试什么 | 如何表达 / 演示入口 |
+| --- | --- |
+| 多个真实后端 | 每个 service 配一个 upstream 和监听端口；[双后端接入](docs/usage.md#接入真实后端) |
+| 两次 4xx 后第三次固定成功 | respond 400 × 2 → respond 200；演示 `/mock` |
+| 从第 n 次开始失败两次 | start_at + repeat: 2；演示 `/nth` 第 5–6 次 503，可改为任意合法 4xx/5xx |
+| 客户端读超时 | timeout 或 delay_before/delay_after；演示 `/timeout`、`/slow-after` |
+| HTTP 错误与错误处理 | 持续 401/503、HTTP 504、无效 JSON 等；完整目录有 33 条场景 |
+| 重试次数与恢复顺序 | 每次逻辑调用使用独立测试 ID；requests 查看记录，verify 返回 CI 退出码 |
+
+还支持真实 TCP Reset、后端执行后的故障、概率采样和延迟抖动。**固定成功用 respond 200；passthrough 的结果由真实后端决定。** 客户端最终异常、界面提示、业务幂等性仍需在被测应用中断言；代理记录不能替代这些结果。
 
 ## 快速体验
 
@@ -25,20 +25,20 @@ bash .agent/run.sh --publish uv run python examples/demo.py
 
 最后一条启动两个演示后端与代理。宿主机入口：orders `http://127.0.0.1:18080`、inventory `http://127.0.0.1:18081`、管理 `http://127.0.0.1:19090`。仅绑定宿主机 loopback；停止使用 Ctrl-C。演示管理 token 为 `local-demo-token`。
 
-另开终端，在容器中调用宿主机映射的演示端口（Docker Desktop / OrbStack）：
+另开终端，使用示例 GET 客户端发起一次逻辑调用（Docker Desktop / OrbStack）：
 
 ```bash
-bash .agent/run.sh sh -c 'for i in 1 2 3; do curl -sS -o /dev/null -w "%{http_code}\n" -H "X-Test-Run-ID: demo" http://host.docker.internal:18080/retry; done'
+bash .agent/run.sh uv run python examples/retry_client.py http://host.docker.internal:18080/retry --run-id readme-client
 ```
 
-应依次看到 `429`、`429`、`200`。同一 ID 继续调用会正常转发；换 ID 或 reset 可从头开始。
+JSON attempts 应依次为 `429`、`429`、`200`，outcome 为 success，退出 0。这个示例根据响应决定是否再请求：仅重试 429/503/读超时，最多三次；成功或其他状态立即停止。它演示固定等待策略，不解析 Retry-After。测试真实应用时替换为应用自身客户端。同一 ID 继续调用会正常转发；重跑前三次故障须换 ID 或 reset。
 
 下一步可按[场景手册](docs/scenarios.md)选择用例，按测试 ID 查询状态和重置。编辑自定义 YAML 前可运行 `bash .agent/run.sh uv run fault-engine schema` 查看配置 JSON Schema；语法和重复键错误会指出行、列。runner 用法见 `bash .agent/run.sh --help`。
 
-把上面的重试结果作为自动验收（演示进程尚在运行，且 scope `demo` 恰好调用过三次）：
+检查代理是否确实收到上述三次请求（演示进程尚在运行）：
 
 ```bash
-bash .agent/run.sh sh -lc 'export FAULT_ADMIN_TOKEN=local-demo-token; uv run fault-engine verify --admin-url http://host.docker.internal:19090 --service orders --scope demo --count 3 --statuses 429 429 200'
+bash .agent/run.sh sh -lc 'export FAULT_ADMIN_TOKEN=local-demo-token; uv run fault-engine verify --admin-url http://host.docker.internal:19090 --service orders --scope readme-client --count 3 --statuses 429 429 200'
 ```
 
 匹配退出 0，断言失败或记录不完整退出 1，参数/网络错误退出 2。到达间隔包含前一次响应耗时，不能作为客户端退避时间的证明。

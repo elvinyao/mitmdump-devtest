@@ -1,14 +1,34 @@
 # 验收记录
 
-最近完整验证日期：2026-09-29。环境：Docker/OrbStack 中的 Linux、Python 3.12.14。依赖由 uv.lock 锁定，其中 mitmproxy 12.2.3、ruff 0.16.8、ty 0.0.83、pytest 9.1.1。
+## 2026-10-03 原始用途复评
+
+结论：在已声明的 HTTP/1.1 开发调试范围内，工具满足多后端反向代理、读超时、4xx/5xx、按次故障与恢复的用途。它负责制造故障和提供请求证据；被测应用的最终结果、异常分类、业务幂等和精确退避需要应用侧断言。
+
+| 原始要求 | 当前实现与验收依据 |
+| --- | --- |
+| 为各后端提供 reverse proxy | 一个 service 对应固定 upstream/端口；多服务真实网络测试与完整双后端接入配置，客户端替换各自 base URL |
+| 模拟超时 | timeout、转发前/后 delay；真实客户端 ReadTimeout，curl 28 与 HTTP 504 分别验收；不将读超时冒充 DNS/建连超时 |
+| 模拟 4xx、5xx | 200–599 的 respond/respond_after；现有状态码、响应体、后端调用断言 |
+| 第 n 次开始连续两次 4xx，之后 OK | start_at + repeat + 固定 respond 200；新增真实客户端测试证明第 1–4 次正常转发、第 5–6 次 429、第 7 次固定 200，后端恰好 4 次调用 |
+| 验证 retry/error handling | 新增响应驱动的参考客户端及 7 项黑盒测试：429/503 后恢复、401 不重试、503 次数上限、读超时后恢复、无效 gzip 不把 HTTP 200 当作客户端成功 |
+| 清晰易用、使用手册完整 | README 按原始需求导航，场景手册先列基础配方，使用手册提供双后端配置、base URL/端口对应、客户端断言矩阵、checkpoint 与重复运行流程 |
+| 易扩展、开发手册完整 | 补齐 config→只读 plan→决策→执行→诊断/验收的动作扩展流程、匹配扩展、jitter 参数实例、修改到测试的对应表；不声称支持热插拔插件 |
+
+本轮独立审查分为用途/协议、使用手册、开发与扩展三个方向。文档验证直接提取四段新命令，在同一 Docker 容器内连接真实 demo，连续运行两轮均通过；只将 host.docker.internal 映射地址替换成容器内直连地址。双真实后端配置通过模型校验，demo SIGTERM 正常退出。本轮没有重新实测宿主机端口映射，相关结果仍引用下面的历史环境记录。
+
+修复了自定义方法 `head` / `hEaD` 被底层误当作标准 `HEAD`，导致 body 缺失或 chunked 响应不完整的问题。原始 socket 回归先得到 12 失败 / 6 通过，再验证 mock、after、透传、Content-Length/chunked、后续 keepalive 请求及真实上游 method。适配保持版本/接口检查、外部适配保护与关闭恢复；仅精确 `HEAD` 不发送 body。参考客户端的无效 gzip 回归也先复现未捕获异常，再改为不重试的 decode_error/退出 1。
+
+独立质量复核进一步发现，对上述自定义方法直接移除复合 Transfer-Encoding 会丢失 gzip/deflate 等编码含义。新增回归先得到 8 失败 / 4 通过，再改为明确拒绝有 body 的复合 chunked 编码，走正常上游 502 错误路径；Journal 为 transport_error/status=null，而非伪造成功。普通方法、精确 HEAD、无 body 的状态语义保持不变，普通 Content-Encoding 压缩也不受此限制。HTTP/适配器 focused 测试合计 56 项通过；开发手册写明了这项兼容边界。
+
+最近完整验证日期：2026-10-03。环境：Docker/OrbStack 中的 Linux、Python 3.12.14。依赖由 uv.lock 锁定，其中 mitmproxy 12.2.3、ruff 0.16.8、ty 0.0.83、pytest 9.1.1。
 
 ## 结果
 
-- **464 tests passed，0 failed，0 skipped**，在上一轮 328 项基础上增加 136 项配置生成、匹配解释、请求记录、管理客户端和真实 CLI 验收回归；pytest 用时 77.51 秒。
-- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**96%**（1659 个 statement、504 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
+- **509 tests passed，0 failed，0 skipped**，在上一轮 464 项基础上增加 45 项：30 项真实 HTTP 协议回归、8 项依赖适配边界、7 项参考客户端黑盒验收；pytest 用时 90.23 秒。
+- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**96%**（1698 个 statement、520 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
 - `uv lock --check`、`uv sync --locked`、`ruff format --check .`、`ruff check .`、`ty check` 全部通过。
-- `uv build` 成功生成 wheel 和 sdist。独立虚拟环境离线安装 wheel，确认从安装路径导入，schema、init/validate/explain、requests/verify/reset/journal-clear、HTTP mock 及请求/响应 trailer 拒绝检查通过。生产锁文件作为版本约束，依赖由 wheel 元数据决定。示例目录保持 2 个服务、33 条规则。
-- 本轮完整检查由 `bash .agent/run.sh bash .agent/check.sh` 执行，退出 0；格式检查覆盖 58 个文件。上一轮已验证登录 shell 的 uv 与 uvx 均为 0.12.17，本轮沿用同一工具链。
+- `uv build` 成功生成 wheel 和 sdist。独立虚拟环境离线安装 wheel，确认从安装路径导入，schema、init/validate/explain、requests/verify/reset/journal-clear、HTTP mock、自定义方法响应分帧及请求/响应 trailer 拒绝检查通过。生产锁文件作为版本约束，依赖由 wheel 元数据决定。示例目录保持 2 个服务、33 条规则。
+- 本轮完整检查由 `bash .agent/run.sh bash .agent/check.sh` 执行，退出 0；格式检查覆盖 60 个文件。上一轮已验证登录 shell 的 uv 与 uvx 均为 0.12.17，本轮沿用同一工具链。
 - 程序和 Docker runner 都实际运行过，测试没有用 mock 替代 mitmproxy 或 TCP reset。
 - 测试保留了 **42 条第三方弃用警告**：mitmproxy 使用 pyparsing 的旧 API，以及 ldap3 对 pyasn1 旧导出的引用。没有将这些警告隐藏或描述为零警告。
 
@@ -85,7 +105,7 @@ bash .agent/run.sh bash .agent/check-wheel.sh
 
 新增 test_sampling.py 的 24 项验证：0/1 概率边界、严格配置、seed/reset 重放、并发 scope 隔离、五种延迟动作、只读计划、概率与延迟通道独立、start_at/cycle 位置、真实 HTTP 后端调用次数、管理摘要和实际延迟日志。全目录可达性测试同时覆盖新增三个示例。
 
-原有测试分布：architecture_integration 1、boundaries 11、CLI 12、config 36、demo 1、dependency_compat 5、engine 10、example_catalog 18、execution_plan 23、extended_scenarios 19、http_review 13、integration 36、lifecycle_review 9、maintainability 14、network_edges 10、regex_safety 17、resource_limits 24、runner 6、runtime_rollback 4、sampling 24、state_review 26、transport 9。易用性扩展增加上表五组共 136 项。
+历史测试分布（328 项基线）：architecture_integration 1、boundaries 11、CLI 12、config 36、demo 1、dependency_compat 5、engine 10、example_catalog 18、execution_plan 23、extended_scenarios 19、http_review 13、integration 36、lifecycle_review 9、maintainability 14、network_edges 10、regex_safety 17、resource_limits 24、runner 6、runtime_rollback 4、sampling 24、state_review 26、transport 9。2026-09-29 易用性扩展增加上表五组共 136 项，达到 464 项。本轮新增 client_contract 7 项，dependency_compat 增至 13 项，http_review 增至 43 项，总计 509 项。
 
 ## 实际端口映射体验
 

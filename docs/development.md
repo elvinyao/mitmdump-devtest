@@ -1,5 +1,16 @@
 # 开发文档
 
+## 从哪里开始
+
+先按 [README](../README.md) 启动演示，再用 [使用文档](usage.md) 跑一遍配置生成、离线解释和请求验收。修改实现前，按以下顺序阅读即可建立完整调用链：
+
+1. `src/fault_engine/config.py` → `plan.py`：输入验证与运行期只读快照的边界。
+2. `engine.py` → `addon.py`：同步选择一个 Decision，再异步执行故障；匹配、序号与网络动作分开。
+3. `runtime.py` → `transport.py` / `limits.py`：服务路由、生命周期、真实 TCP 行为与配额所有权。
+4. `journal.py` → `admin.py` / `admin_client.py`：请求证据、查询和断言；`local_commands.py` 负责离线模板与解释。
+
+下文的源文件名均相对于 `src/fault_engine/`。日常执行命令见“工具链与日常命令”，按改动选择测试见“测试策略”；新增行为的具体接入点见最后的扩展指南。
+
 ## 架构
 
 ```text
@@ -32,7 +43,7 @@ Runtime 现在在构造 Master 前拒绝第二个活跃实例。生命周期锁�
 | journal.py | 有界的请求元数据、幂等终结、实例游标和完整性验证 |
 | admin.py | 独立 aiohttp 管理 API、鉴权、输入大小和 reset 校验 |
 | runtime.py | 组装、启动、异常回滚和关闭 |
-| http1_compat.py | 活跃 Runtime 期间安装并在关闭后恢复的 trailer 拒绝适配 |
+| http1_compat.py | 活跃 Runtime 期间安装并在关闭后恢复的 trailer 拒绝与 HEAD 大小写定界适配 |
 | local_commands.py | 四种配置模板、独占创建文件、离线请求解析与解释 |
 | admin_client.py | 有界管理 HTTP 客户端、环境凭证、断言退出码 |
 | cli.py / __main__.py | 命令注册、配置错误脱敏、serve 信号处理 |
@@ -93,6 +104,8 @@ bash .agent/run.sh bash .agent/check.sh
 
 Python 固定 3.12，包元数据和锁文件共同约束 mitmproxy==12.2.3、h11==0.16.0；Pydantic Core 的公开 schema API 也显式列为依赖。runner 引导 uv 0.12.17。`.venv-docker` 不能在 macOS 宿主机运行。ruff/ty 排除该第三方虚拟环境，ty 检查 src、tests 和 examples。
 
+[`examples/retry_client.py`](../examples/retry_client.py) 是仓库中的 GET 重试教学示例，使用 `uv sync --locked` 安装的开发依赖 httpx；它不随生产 wheel 发布。默认最多尝试 3 次，仅在 429、503 或读取超时后固定等待并重试；它不解析业务 payload、不解释 Retry-After，单次网络操作超时也不是整体重试截止时间。接入真实应用时替换请求循环，并分别断言应用结果和代理 Journal，不能用代理记录的 200 代替客户端成功。
+
 runner 的 `--help` 与缺少命令提示无需 Docker；实际执行仍全部经 Docker。容器入口将缓存中的 uv/uvx 链接到 `/usr/local/bin`，保证 `sh -lc` 重置 PATH 后仍能找到工具。`tests/test_runner.py` 在容器内用替代 Docker CLI 验证参数原样传递、发布地址、工作目录和失败退出码，不启动嵌套容器。
 
 `fault-engine schema` 直接从 Pydantic 模型输出 JSON Schema，不另存一份需要同步的静态定义。YAML 错误只输出行列；字段错误只保留已知 schema 路径，禁止回显配置值或自定义字典 key。
@@ -103,34 +116,63 @@ runner 的 `--help` 与缺少命令提示无需 Docker；实际执行仍全部�
 
 ## 测试策略
 
-- 配置单元测试拒绝模糊、冲突或隐式转换输入。
-- 引擎单元测试覆盖序号边界、规则优先级、scope、TTL、容量和 reset。
-- transport 使用真实 TCP socket 测试重置、隔离、二进制、半关闭和背压关闭。
-- integration 启动真实 mitmproxy 与记录调用的后端，用调用次数区分“注入错误”和“后端已执行”。
-- network_edges 覆盖私有 CA TLS、证书拒绝、多服务、HEAD keepalive、取消和在途 reset。
-- boundaries 验证非法方法、原始 Host 匹配、控制头移除、容量、日志、大小上限和端口释放。
-- CLI 和 demo 测试使用子进程，实际运行 curl 与 SIGTERM；超时断言用有边界的等待，不要求精确毫秒。
-- http_review 使用原始 HTTP 字节验证 method 大小写、压缩 body、Latin-1、chunked、Expect、绝对 URL 和 trailer 拒绝。
-- lifecycle_review 覆盖并发关闭、调用者取消、慢管理请求、启动回滚和进程全局状态隔离。
-- state_review 覆盖错误脱敏、配置字节边界、保留 scope 头、多 scope 并发与 TTL；example_catalog 实际执行仓库中的示例规则。
-- maintainability 覆盖管理过滤、摘要脱敏和过期 reset；example_catalog 还验证完整规则目录的可达性，避免宽泛规则遮蔽其他例子。
-- regex_safety/execution_plan 覆盖非回溯匹配、语法边界、深层只读快照、累计序列、分页和过期积压；architecture_integration 覆盖真实在途响应与 Admin 使用相同 Plan。
-- runtime_rollback/dependency_compat 覆盖重复取消、清理失败重试、依赖版本/API 边界及适配器安装恢复；resource_limits 覆盖慢上传、跨服务配额、拒绝发送超时、复用连接和释放路径。
-- local_commands 覆盖生成器不覆盖文件、纯匹配解释与采样一致；journal/journal_integration 覆盖保留窗口、终结、真实 HTTP 与脱敏；admin_client/usability_workflow 覆盖错误响应、真实 CLI 退出码和 503→503→200 重置重跑。
+先运行与改动对应的测试，最后运行完整 check。下表文件名加上 `tests/` 前缀后，填入 `bash .agent/run.sh uv run pytest <测试路径> -q`：
+
+| 改动 | 优先测试 | 必须保留的证据 |
+| --- | --- | --- |
+| 配置字段、错误提示与只读快照 | `test_config.py`、`test_execution_plan.py`、`test_state_review.py` | 拒绝隐式转换/冲突输入，错误脱敏，原配置变动不改变运行计划 |
+| 匹配、序号、scope、TTL 与采样 | `test_engine.py`、`test_regex_safety.py`、`test_sampling.py`、`test_local_commands.py` | 优先级、序列边界、scope 隔离、非回溯匹配、explain 与 decide 一致 |
+| HTTP 动作及协议行为 | `test_integration.py`、`test_extended_scenarios.py`、`test_network_edges.py`、`test_boundaries.py`、`test_http_review.py` | 真实客户端结果和后端调用次数；TLS、HEAD、取消、原始 Host、控制头、body 上限及原始 HTTP 字节 |
+| TCP、连接和请求配额 | `test_transport.py`、`test_resource_limits.py` | ECONNRESET 104、其他连接不受影响、半关闭、背压、慢上传、复用连接及凭据归还 |
+| 生命周期、计划共享与依赖适配 | `test_lifecycle_review.py`、`test_runtime_rollback.py`、`test_architecture_integration.py`、`test_dependency_compat.py` | 并发/取消关闭、启动回滚重试、端口释放、全局状态隔离及同一 Plan |
+| 管理摘要、观察记录与验收 | `test_maintainability.py`、`test_journal.py`、`test_journal_integration.py`、`test_admin_client.py`、`test_usability_workflow.py` | 过滤/分页、脱敏、保留窗口、终结、真实 CLI 退出码和重置重跑 |
+| 客户端是否按策略重试 | `test_client_contract.py` | 子进程执行真实示例客户端；429/503、读取超时、尝试上限、非重试状态、响应解码失败，以及第 5/6 次失败、第 7 次固定成功；同时断言客户端与后端结果 |
+| CLI、示例与工具链 | `test_cli.py`、`test_demo.py`、`test_example_catalog.py`、`test_runner.py` | 真实子进程/curl/SIGTERM、完整 YAML 目录的规则可达性、runner 参数传递；安装包另由 `.agent/check-wheel.sh` 验证 |
+
+`tests/conftest.py` 提供 `rule()`、真实后端 `upstream` 和启动 Runtime 的 `proxy` fixture。HTTP 动作测试同时检查客户端结果与后端收到的请求，区分“故障在发送前发生”和“后端已经执行”。涉及超时或取消时用有上限的等待，不要求精确毫秒；涉及 wire 格式或 reset 时使用原始 socket 断言。
 
 测试后端直接监听端口 0；需要先写入 Config 的端口由 `free_port()` 保证同一测试进程内不重复分配，避免服务/admin 尚未绑定时得到同一端口。该辅助函数不提供跨进程保留保证；监听器测试应在隔离的 runner 网络中执行。
 
-`http1_compat.py` 有意适配 mitmproxy 12.2.3 的私有 HTTP/1 reader 工厂：h11 解析出非空 trailer 时转为协议错误，避免依赖内部抛出未处理的 NotImplementedError。安装前检查依赖版本、工厂签名与 reader 能力，拒绝覆盖其他适配器。没有复制整套 HTTP parser，也不静默丢弃 trailer。依赖升级需要同步包元数据、支持版本表和锁文件，并重跑源码与已安装 wheel 的双向 trailer 测试；上游原生处理修复后应移除此适配。请求侧原生错误路径会先关连接，不能承诺返回 400；响应侧为 502。
+`http1_compat.py` 对 mitmproxy 12.2.3 安装两个局部适配。私有 HTTP/1 reader 工厂在 h11 解析出非空 trailer 时转为协议错误，避免依赖内部抛出未处理的 NotImplementedError；请求侧原生错误路径会先关连接，不能承诺返回 400，响应侧为 502。`expected_http_body_size()` 的适配只让自定义方法 `head` / 混合大小写变体按普通响应定界；使用请求的浅副本，不改变发往后端的原始 method 或上传定界。仅精确 `HEAD` 因方法语义而无响应 body。Addon 将这些自定义方法的完整缓冲、单一 chunked 响应改用 Content-Length，避免依赖省略最后一个 chunk 而破坏 keepalive。
 
-采用 superpowers 的设计审批、TDD、根因排查、独立审查和完成前验证。先复现缺失行为或缺陷，再改实现。不要把网络异常全部放宽为“任何 exception”来让测试通过；reset 的原始 socket 断言必须保留。
+这些自定义 HEAD 大小写方法若收到需要读取 body、且使用 `gzip, chunked` 等组合 Transfer-Encoding 的上游响应，会走正常协议错误路径返回 502；不移除编码元数据后转发压缩字节。精确 HEAD、其他方法和 304 等本来无 body 的响应不受此额外限制影响。该错误可能发生在后端已执行之后，Journal 记录 `transport_error`、`status=null`、`upstream_received=false`，也说明后者不能证明后端未执行。
+
+安装前检查依赖版本、两个函数的签名与行为，拒绝覆盖其他适配器；关闭时恢复各自原函数。没有复制整套 HTTP parser，也不静默丢弃 trailer。依赖升级需要同步包元数据、支持版本表和锁文件，重跑真实 HTTP 的方法大小写/后续请求对齐测试，以及源码与已安装 wheel 的双向 trailer 测试；上游原生处理修复后应移除相应适配。`test_dependency_compat.py` 覆盖外部适配冲突、API 漂移、安装/恢复和原请求不变性，`test_http_review.py` 覆盖 mock、after 与透传的真实字节和后端调用。
+
+仓库开发流程是：先明确行为与边界，添加能复现缺失行为或缺陷的测试，再修改实现、独立审查并完成验证。使用 Docker runner 即可执行，不要求安装额外的工作流插件。历史设计决策保存在 [初始设计](superpowers/specs/2026-09-22-fault-engine-design.md) 和 [易用性扩展设计](superpowers/specs/2026-09-29-usability-design.md)；当前行为以实现、使用文档与测试为准。不要把网络异常全部放宽为“任何 exception”来让测试通过；reset 的原始 socket 断言必须保留。
 
 ## 扩展动作
 
-1. 在 config.py 新建严格动作模型，将 `action` 加入带 discriminator 的 Action union；明确允许参数及互斥项。
-2. 先添加配置和行为失败测试。Engine 只负责选择动作，一般不需为新动作增加网络分支。
-3. 在 addon 对应阶段实现动作。需要 TCP 行为时通过 transport 接口，不能直接访问私有 socket 或把 kill 叫作 reset。
-4. 添加真实客户端集成测试，同时断言后端是否收到请求、其他连接是否受影响。
-5. 更新使用文档的动作表、场景手册、示例和验收映射，跑整套 check。目录测试会读取真实 YAML；添加正则匹配示例时，在代表路径表补一个可匹配请求。
+现有动作通过显式类型与分支连接，没有自动注册插件。新增动作或参数必须走完 `config → plan → Engine → Addon → 诊断/验收`，仅增加 YAML 字段不会自动成为运行期行为。
+
+1. 先定义发送前还是收到完整上游响应后执行、是否调用后端、客户端应看到什么，以及取消/失败时的结果。添加对应配置和行为失败测试。在 `config.py` 为新动作建立严格模型并加入带 discriminator 的 `Action` union；增加现有动作参数时补齐类型、上下界、互斥与组合约束。
+2. 在 `plan.py` 的 `ActionPlan` 和 `_action_plan()` 显式承接新参数。该转换只复制已列出的字段，配置验证通过不代表字段已经进入运行计划。可变集合须复制并冻结，响应编码在编译时完成；用 `test_execution_plan.py` 验证值被保留，修改原配置不会影响计划或在途 Decision。
+3. 保留 Engine 的同步选择边界。普通网络动作无需在 Engine 加入 I/O；涉及概率、延迟或序列选择时检查 `_decision()`、`_select()` 与 explain。抖动必须使用既有独立采样通道，不得让执行顺序推进全局随机状态，也不能修改共享 ActionPlan。
+4. 在 `addon.py` 的 `_request()` 或 `_response()` 对应阶段实现动作。异步等待使用能被关闭/取消路径管理的方式；TCP 行为通过 `transport.py` 接口，不能直接访问私有 socket 或把 kill 叫作 reset。检查 `requestheaders` 取得请求凭据之后，成功、异常、客户端断开和关闭都能释放；容量拒绝不能分配场景序号。
+5. 同步决定观察语义。每条记录只终结一次，`Journal.mark_upstream()` 表示已收到上游响应；`upstream_received=false` 不证明后端从未执行，`response_prepared` 不表示客户端已经读完响应。新增提前返回、断开或异常分支须明确 outcome/status，避免遗留 pending 或把本地合成响应算作上游响应。
+6. 审查 `admin._action_summary()`、`Engine.explain()` 和 `FaultAddon._event()` 的字段允许列表，显式选择可以公开的新参数。不要序列化整个动作对象；Journal 只保存既定元数据，scope 使用非敏感测试 ID，body/header/query/path 不进入记录。
+7. 添加真实客户端集成测试，同时断言后端调用次数、其他连接是否受影响和资源回收。更新 [动作表](usage.md)、[场景手册](scenarios.md)、`examples/scenarios.yaml` 与 [验收映射](verification.md)，执行完整 check。目录测试读取真实 YAML；添加规则时同步补齐 `test_example_catalog.py` 的代表请求，确保没有被更早的规则遮蔽。
+
+### 现有参数的完整例子：jitter_seconds
+
+已有 `respond` 步骤可设置 `delay_seconds: 0.1` 和 `jitter_seconds: 0.2`。追踪这个参数即可检查类似扩展是否漏掉某一层：
+
+| 层 | 已有实现 |
+| --- | --- |
+| 输入 | `Respond.valid_body()` 验证基础延迟与抖动之和不超过 3600；`Delay.bounded_delay()` 对延迟动作执行同一约束 |
+| 计划 | `_action_plan()` 将基础值与 jitter 复制到只读 `ActionPlan`，`RulePlan` 保存 probability/seed |
+| 决策 | `_decision()` 先决定是否抽中，再由 `delay` 通道计算附加时间；`replace()` 产生本次有效延迟并清零该副本的 jitter |
+| 执行 | `_respond()` 等待本次 `delay_seconds`；延迟动作读取本次 `seconds`。Addon 不再次抽样 |
+| 诊断 | `/rules` 返回计划的基础值及非零 jitter；explain 和事件日志返回本次有效延迟；Journal 记录实际 action/sampled 与从场景选择到终结的时长 |
+| 验证 | `test_sampling.py` 覆盖范围、重放、scope 隔离、概率/延迟通道独立与真实 HTTP；只读快照由 `test_execution_plan.py` 补充 |
+
+## 扩展匹配条件
+
+1. 在 `config.Match` 定义输入、缺省值、规范化和互斥规则，再在 `MatchPlan` / `compile_plan()` 显式复制。需要预编译的表达式在计划构建阶段处理；正则沿用 `matching.py` 的长度限制及非回溯实现。
+2. 在 `Engine._match_failures()` 增加匹配维度，使 decide 与 explain 共用一个判定。失败原因只返回维度名称，不回显请求值。保持第一条匹配规则胜出、条件之间 AND，以及未匹配请求不占序号的契约。
+3. 检查实时请求和离线输入的等价性：`FaultAddon._request()` 在改写 upstream/Host、移除 scope 头之前匹配；`local_commands.explain_request()` 负责离线解析。若新条件需要额外请求信息，应向 Engine 显式传入必要数据，不让它依赖 HTTPFlow 或网络。方法大小写、去除 query 后的 path、重复 query 值及 header 规范化必须保持一致。CLI 拒绝重复 header 行，普通重复头的测试应传入实时请求合并后的等价值；scope 头实时也禁止重复。
+4. 更新 `/rules` 的 match 摘要时单独决定公开字段，禁止自动输出新的敏感匹配值。补充配置、计划不可变性、命中/未命中、优先级、explain 无状态副作用，以及真实 HTTP 与离线解释一致性的回归测试。
+5. 同步 schema 所来自的模型、使用文档及可达的 YAML 示例；无需维护另一份静态 JSON Schema。执行对应测试和完整 check。
 
 ## 当前边界
 
