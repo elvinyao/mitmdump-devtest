@@ -307,9 +307,22 @@ class FaultAddon:
                 elif action.action in {"reset_after", "disconnect_after"}:
                     if self._disconnect(flow, action):
                         return
-        if flow.request.method == "HEAD" and flow.response is not None:
+        method = flow.request.data.method
+        if method == b"HEAD" and flow.response is not None:
             # Preserve the representation length while emitting no body on the wire.
             flow.response.raw_content = b""
+        elif method.upper() == b"HEAD" and flow.response is not None:
+            # These are distinct custom methods. mitmproxy 12 also suppresses the
+            # final chunk for their responses, so frame the fully buffered body
+            # with its length instead. The compatibility adapter preserves the
+            # upstream body while leaving the actual request method untouched.
+            if "chunked" in flow.response.headers.get("transfer-encoding", "").lower():
+                flow.response.headers.pop("transfer-encoding", None)
+                flow.response.headers.pop("trailer", None)
+                if flow.response.status_code not in {204, 304}:
+                    flow.response.headers["Content-Length"] = str(
+                        len(flow.response.raw_content or b"")
+                    )
         self._event(
             flow, "response", str(flow.response.status_code) if flow.response else "missing"
         )

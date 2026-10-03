@@ -107,11 +107,17 @@ async def main() -> None:
     async def upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             calls.append(await reader.readuntil(b"\r\n\r\n"))
-            writer.write(
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
-                b"Trailer: X-Checksum\r\nConnection: close\r\n\r\n"
-                b"3\r\nabc\r\n0\r\nX-Checksum: ok\r\n\r\n"
-            )
+            if calls[-1].startswith(b"hEaD /custom "):
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                    b"Connection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+                )
+            else:
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                    b"Trailer: X-Checksum\r\nConnection: close\r\n\r\n"
+                    b"3\r\nabc\r\n0\r\nX-Checksum: ok\r\n\r\n"
+                )
             await writer.drain()
         finally:
             writer.close()
@@ -210,6 +216,21 @@ async def main() -> None:
                 assert response.status == 502
                 await response.read()
             assert len(calls) == 1
+            reader, writer = await asyncio.open_connection("127.0.0.1", ports[0])
+            try:
+                writer.write(b"hEaD /custom HTTP/1.1\r\nHost: wheel\r\nConnection: close\r\n\r\n")
+                await writer.drain()
+                wire = await asyncio.wait_for(reader.read(), 3)
+                headers, body = wire.split(b"\r\n\r\n", 1)
+                assert headers.startswith(b"HTTP/1.1 200")
+                assert b"content-length: 3" in headers.lower()
+                assert b"transfer-encoding" not in headers.lower()
+                assert body == b"abc"
+                assert len(calls) == 2 and calls[-1].startswith(b"hEaD /custom ")
+            finally:
+                writer.close()
+                with suppress(OSError):
+                    await writer.wait_closed()
     finally:
         await runtime.close()
         server.close()
@@ -219,7 +240,7 @@ async def main() -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
     print(
         "Installed wheel: schema, init/validate/explain, admin requests/verify/reset/clear, "
-        "HTTP response, request/response trailer checks passed"
+        "HTTP response, custom method framing, request/response trailer checks passed"
     )
 
 

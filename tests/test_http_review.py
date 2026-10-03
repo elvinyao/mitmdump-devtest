@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import gzip
+import zlib
 from contextlib import suppress
 
 import pytest
@@ -17,6 +18,15 @@ async def response_head(reader):
 
 
 async def response_body(reader, headers):
+    if (b"transfer-encoding", b"chunked") in headers:
+        chunks = []
+        while True:
+            size = int(await asyncio.wait_for(reader.readline(), 2), 16)
+            if not size:
+                assert await asyncio.wait_for(reader.readexactly(2), 2) == b"\r\n"
+                return b"".join(chunks)
+            chunks.append(await asyncio.wait_for(reader.readexactly(size), 2))
+            assert await asyncio.wait_for(reader.readexactly(2), 2) == b"\r\n"
     length = next(int(value) for name, value in headers if name == b"content-length")
     return await asyncio.wait_for(reader.readexactly(length), 2)
 
@@ -66,6 +76,24 @@ async def wire_upstream():
                     await writer.drain()
                     continue
                 payload = b"upstream"
+                if b" /transfer-" in request_line:
+                    coding = request_line.split()[1].removeprefix(b"/transfer-")
+                    payload = (
+                        gzip.compress(payload) if coding == b"gzip" else zlib.compress(payload)
+                    )
+                    writer.write(
+                        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: " + coding + b", chunked\r\n\r\n"
+                    )
+                    if not request_line.startswith(b"HEAD "):
+                        writer.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n")
+                    await writer.drain()
+                    continue
+                if b" /chunked-response " in request_line:
+                    writer.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                    if not request_line.startswith(b"HEAD "):
+                        writer.write(b"8\r\nupstream\r\n0\r\n\r\n")
+                    await writer.drain()
+                    continue
                 encoding = b""
                 if b" /compressed " in request_line:
                     payload = gzip.compress(b"compressed upstream \x00\xff", mtime=0)
@@ -114,6 +142,72 @@ async def test_method_matching_preserves_case(proxy, method, expected):
             await writer.drain()
             status, _ = await response_head(reader)
             assert int(status.split()[1]) == expected
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.parametrize("method", [b"head", b"hEaD", b"HEAD"])
+@pytest.mark.parametrize("action", ["respond", "respond_after", "passthrough"])
+@pytest.mark.parametrize("path", ["/fault", "/chunked-response"])
+async def test_only_exact_head_omits_body_on_keepalive(proxy, wire_upstream, method, action, path):
+    origin, calls = wire_upstream
+    services = [{"id": "orders", "port": free_port(), "upstream": origin}]
+    step = {"action": action}
+    if action != "passthrough":
+        step.update(status=200, body="mock body")
+    scenario = rule(step, match={"path": path, "methods": [method.decode()]})
+    async with proxy([scenario], services=services) as app:
+        reader, writer = await asyncio.open_connection("127.0.0.1", app.config.services[0].port)
+        try:
+            writer.write(method + f" {path} HTTP/1.1\r\nHost: test\r\n\r\n".encode())
+            await writer.drain()
+            status, headers = await response_head(reader)
+            assert status.startswith(b"HTTP/1.1 200 ")
+            if method != b"HEAD":
+                expected = b"upstream" if action == "passthrough" else b"mock body"
+                assert await response_body(reader, headers) == expected
+            writer.write(b"GET /normal HTTP/1.1\r\nHost: test\r\n\r\n")
+            await writer.drain()
+            status, headers = await response_head(reader)
+            assert status.startswith(b"HTTP/1.1 200 ")
+            assert await response_body(reader, headers) == b"upstream"
+            expected_calls = [] if action == "respond" else [method + f" {path} HTTP/1.1".encode()]
+            assert [call[0] for call in calls] == expected_calls + [b"GET /normal HTTP/1.1"]
+            row = app.journal.page()["requests"][0]
+            assert row["method"] == method.decode()
+            assert row["action"] == action
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.parametrize("method", [b"head", b"hEaD", b"HEAD"])
+@pytest.mark.parametrize("coding", ["gzip", "deflate"])
+@pytest.mark.parametrize("action", ["passthrough", "respond_after"])
+async def test_custom_head_rejects_combined_transfer_codings(
+    proxy, wire_upstream, method, coding, action
+):
+    origin, calls = wire_upstream
+    services = [{"id": "orders", "port": free_port(), "upstream": origin}]
+    step = {"action": action}
+    if action == "respond_after":
+        step.update(status=418, body="replacement")
+    path = f"/transfer-{coding}"
+    async with proxy([rule(step, path=path)], services=services) as app:
+        reader, writer = await asyncio.open_connection("127.0.0.1", app.config.services[0].port)
+        try:
+            writer.write(method + f" {path} HTTP/1.1\r\nHost: test\r\n\r\n".encode())
+            await writer.drain()
+            status, _ = await response_head(reader)
+            expected = (418 if action == "respond_after" else 200) if method == b"HEAD" else 502
+            assert int(status.split()[1]) == expected
+            assert [call[0] for call in calls] == [method + f" {path} HTTP/1.1".encode()]
+            row = app.journal.page()["requests"][0]
+            if method != b"HEAD":
+                assert row["outcome"] == "transport_error"
+                assert row["status"] is None
+                assert row["upstream_received"] is False
         finally:
             writer.close()
             await writer.wait_closed()
