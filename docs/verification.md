@@ -1,5 +1,19 @@
 # 验收记录
 
+## 2026-10-05 全仓 review 后修复
+
+本轮重新检查实现、测试、示例、手册和安装包流程。原有 509 项测试全部通过，但独立真实 HTTP/CLI 探针发现以下三个未覆盖的问题，现已修复并补回归：
+
+| 问题 | 修复与验收 |
+| --- | --- |
+| 103 中间响应提前结束流、触发后置动作 | 在受版本保护的 HTTP/1 响应解析暂停点消费非 101 的 1xx，等待完整最终响应；真实 socket 检查分片/同包、多次中间响应、部分最终 body、透传/后置动作、Expect 上传、EOF、keepalive、取消与关闭；101 保留原路径 |
+| reset 忽略 URL 过滤条件并扩大重置范围 | 任意 query 在读取 JSON 和修改 Engine 之前返回 400；20 种错误 query/body 组合均保持两个 scope 原状态，合法 JSON 精确重置与显式全局重置仍可用 |
+| 合法十万条验收结果超过 CLI 2 MiB 限制 | verify 单独使用 4 MiB，其他命令保持 2 MiB；真实 Journal→admin→CLI 验证十万条记录匹配退出 0、次数不匹配退出 1，并保留全部结果；分块响应恰好上限通过、超出一个字节拒绝 |
+
+失败证据先于修复：1xx 原始 socket 测试复现 103 被当成最终响应；reset 得到 20 失败 / 2 通过；大容量与分块边界得到 2 失败 / 3 通过。修复后分别通过，再进行独立代码与手册复核。旧安装包也在新增 reset 检查处失败；最终完整检查已重新构建并安装 wheel，确认 reset 拒绝和 103→200 行为通过。
+
+中间响应最多 100 个/请求且不向客户端转发 hints；超限或最终响应缺失走上游错误路径。大容量修复没有放宽管理请求体的 4 KiB 限制，不能据此声明一次提交十万项 statuses；完整缓冲、协议支持与宿主机映射边界仍按手册说明。
+
 ## 2026-10-03 原始用途复评
 
 结论：在已声明的 HTTP/1.1 开发调试范围内，工具满足多后端反向代理、读超时、4xx/5xx、按次故障与恢复的用途。它负责制造故障和提供请求证据；被测应用的最终结果、异常分类、业务幂等和精确退避需要应用侧断言。
@@ -20,15 +34,15 @@
 
 独立质量复核进一步发现，对上述自定义方法直接移除复合 Transfer-Encoding 会丢失 gzip/deflate 等编码含义。新增回归先得到 8 失败 / 4 通过，再改为明确拒绝有 body 的复合 chunked 编码，走正常上游 502 错误路径；Journal 为 transport_error/status=null，而非伪造成功。普通方法、精确 HEAD、无 body 的状态语义保持不变，普通 Content-Encoding 压缩也不受此限制。HTTP/适配器 focused 测试合计 56 项通过；开发手册写明了这项兼容边界。
 
-最近完整验证日期：2026-10-03。环境：Docker/OrbStack 中的 Linux、Python 3.12.14。依赖由 uv.lock 锁定，其中 mitmproxy 12.2.3、ruff 0.16.8、ty 0.0.83、pytest 9.1.1。
+最近完整验证日期：2026-10-05。环境：Docker/OrbStack 中的 Linux、Python 3.12.14。依赖由 uv.lock 锁定，其中 mitmproxy 12.2.3、ruff 0.16.8、ty 0.0.83、pytest 9.1.1。
 
 ## 结果
 
-- **509 tests passed，0 failed，0 skipped**，在上一轮 464 项基础上增加 45 项：30 项真实 HTTP 协议回归、8 项依赖适配边界、7 项参考客户端黑盒验收；pytest 用时 90.23 秒。
-- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**96%**（1698 个 statement、520 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
+- **567 tests passed，0 failed，0 skipped**，在上一轮 509 项基础上增加 58 项：25 项中间响应协议回归、5 项依赖适配边界、22 项 reset 契约、6 项大容量与响应限额回归；pytest 用时 94.64 秒。
+- coverage 同时统计行与分支，并包含 CLI/demo 子进程：**96%**（1762 个 statement、544 个 branch）。覆盖率是测试范围指标，不是对任意网络环境的正确性保证。
 - `uv lock --check`、`uv sync --locked`、`ruff format --check .`、`ruff check .`、`ty check` 全部通过。
-- `uv build` 成功生成 wheel 和 sdist。独立虚拟环境离线安装 wheel，确认从安装路径导入，schema、init/validate/explain、requests/verify/reset/journal-clear、HTTP mock、自定义方法响应分帧及请求/响应 trailer 拒绝检查通过。生产锁文件作为版本约束，依赖由 wheel 元数据决定。示例目录保持 2 个服务、33 条规则。
-- 本轮完整检查由 `bash .agent/run.sh bash .agent/check.sh` 执行，退出 0；格式检查覆盖 60 个文件。上一轮已验证登录 shell 的 uv 与 uvx 均为 0.12.17，本轮沿用同一工具链。
+- `uv build` 成功生成 wheel 和 sdist。独立虚拟环境离线安装 wheel，确认从安装路径导入，schema、init/validate/explain、requests/verify/reset/journal-clear、HTTP mock、自定义方法响应分帧、中间响应、reset 查询参数拒绝及请求/响应 trailer 拒绝检查通过。生产锁文件作为版本约束，依赖由 wheel 元数据决定。示例目录保持 2 个服务、33 条规则。
+- 本轮完整检查由 `bash .agent/run.sh bash .agent/check.sh` 执行，退出 0；格式检查覆盖 63 个文件。上一轮已验证登录 shell 的 uv 与 uvx 均为 0.12.17，本轮沿用同一工具链。
 - 程序和 Docker runner 都实际运行过，测试没有用 mock 替代 mitmproxy 或 TCP reset。
 - 测试保留了 **42 条第三方弃用警告**：mitmproxy 使用 pyparsing 的旧 API，以及 ldap3 对 pyasn1 旧导出的引用。没有将这些警告隐藏或描述为零警告。
 
@@ -105,7 +119,7 @@ bash .agent/run.sh bash .agent/check-wheel.sh
 
 新增 test_sampling.py 的 24 项验证：0/1 概率边界、严格配置、seed/reset 重放、并发 scope 隔离、五种延迟动作、只读计划、概率与延迟通道独立、start_at/cycle 位置、真实 HTTP 后端调用次数、管理摘要和实际延迟日志。全目录可达性测试同时覆盖新增三个示例。
 
-历史测试分布（328 项基线）：architecture_integration 1、boundaries 11、CLI 12、config 36、demo 1、dependency_compat 5、engine 10、example_catalog 18、execution_plan 23、extended_scenarios 19、http_review 13、integration 36、lifecycle_review 9、maintainability 14、network_edges 10、regex_safety 17、resource_limits 24、runner 6、runtime_rollback 4、sampling 24、state_review 26、transport 9。2026-09-29 易用性扩展增加上表五组共 136 项，达到 464 项。本轮新增 client_contract 7 项，dependency_compat 增至 13 项，http_review 增至 43 项，总计 509 项。
+历史测试分布（328 项基线）：architecture_integration 1、boundaries 11、CLI 12、config 36、demo 1、dependency_compat 5、engine 10、example_catalog 18、execution_plan 23、extended_scenarios 19、http_review 13、integration 36、lifecycle_review 9、maintainability 14、network_edges 10、regex_safety 17、resource_limits 24、runner 6、runtime_rollback 4、sampling 24、state_review 26、transport 9。2026-09-29 易用性扩展增加上表五组共 136 项，达到 464 项。2026-10-03 新增 client_contract 7 项，dependency_compat 增至 13 项，http_review 增至 43 项，总计 509 项。本轮新增 interim_responses 25 项、reset_contract 22 项、large_verification 5 项，dependency_compat 增至 18 项、admin_client 增至 61 项，总计 567 项。
 
 ## 实际端口映射体验
 

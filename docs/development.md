@@ -43,7 +43,7 @@ Runtime 现在在构造 Master 前拒绝第二个活跃实例。生命周期锁�
 | journal.py | 有界的请求元数据、幂等终结、实例游标和完整性验证 |
 | admin.py | 独立 aiohttp 管理 API、鉴权、输入大小和 reset 校验 |
 | runtime.py | 组装、启动、异常回滚和关闭 |
-| http1_compat.py | 活跃 Runtime 期间安装并在关闭后恢复的 trailer 拒绝与 HEAD 大小写定界适配 |
+| http1_compat.py | 活跃 Runtime 期间安装并在关闭后恢复的 trailer 拒绝、HEAD 大小写定界与中间响应适配 |
 | local_commands.py | 四种配置模板、独占创建文件、离线请求解析与解释 |
 | admin_client.py | 有界管理 HTTP 客户端、环境凭证、断言退出码 |
 | cli.py / __main__.py | 命令注册、配置错误脱敏、serve 信号处理 |
@@ -110,6 +110,8 @@ runner 的 `--help` 与缺少命令提示无需 Docker；实际执行仍全部�
 
 `fault-engine schema` 直接从 Pydantic 模型输出 JSON Schema，不另存一份需要同步的静态定义。YAML 错误只输出行列；字段错误只保留已知 schema 路径，禁止回显配置值或自定义字典 key。
 
+管理 CLI 对 `verify` 单独使用 4 MiB 响应上限：最大 100000 条记录的状态码/null 和有限浮点间隔加 JSON 分隔符小于 3.4 MB，另留固定字段空间。其他命令仍为 2 MiB，不能取消流式累计大小检查。修改 Journal 容量或验收输出结构时重新核算此上界，并运行 `test_large_verification.py` 的真实 CLI 往返和分块边界测试；管理请求体的 4 KiB 限制独立生效。
+
 完整 check 在构建后调用 `.agent/check-wheel.sh`：将锁定生产依赖导出为版本约束，仅以实际 wheel 为安装目标，离线安装到临时虚拟环境，从仓库外执行 schema、init/validate/explain、管理 CLI、HTTP mock 及双向 trailer 拒绝检查。所需依赖由 wheel 元数据决定，缓存由前面的 `uv sync --locked` 准备。这样验证安装包的依赖声明和导入路径，而不只验证 editable 源码环境。
 
 依赖升级使用 `bash .agent/run.sh uv lock --upgrade-package <package>`，随后执行完整 check。runner 的多个容器共享虚拟环境；不要并发修改依赖或格式化同一文件。无需 sudo 在宿主机安装工具。
@@ -122,10 +124,10 @@ runner 的 `--help` 与缺少命令提示无需 Docker；实际执行仍全部�
 | --- | --- | --- |
 | 配置字段、错误提示与只读快照 | `test_config.py`、`test_execution_plan.py`、`test_state_review.py` | 拒绝隐式转换/冲突输入，错误脱敏，原配置变动不改变运行计划 |
 | 匹配、序号、scope、TTL 与采样 | `test_engine.py`、`test_regex_safety.py`、`test_sampling.py`、`test_local_commands.py` | 优先级、序列边界、scope 隔离、非回溯匹配、explain 与 decide 一致 |
-| HTTP 动作及协议行为 | `test_integration.py`、`test_extended_scenarios.py`、`test_network_edges.py`、`test_boundaries.py`、`test_http_review.py` | 真实客户端结果和后端调用次数；TLS、HEAD、取消、原始 Host、控制头、body 上限及原始 HTTP 字节 |
+| HTTP 动作及协议行为 | `test_integration.py`、`test_extended_scenarios.py`、`test_network_edges.py`、`test_boundaries.py`、`test_http_review.py`、`test_interim_responses.py` | 真实客户端结果和后端调用次数；TLS、HEAD、取消、中间响应与最终响应、原始 Host、控制头、body 上限及原始 HTTP 字节 |
 | TCP、连接和请求配额 | `test_transport.py`、`test_resource_limits.py` | ECONNRESET 104、其他连接不受影响、半关闭、背压、慢上传、复用连接及凭据归还 |
 | 生命周期、计划共享与依赖适配 | `test_lifecycle_review.py`、`test_runtime_rollback.py`、`test_architecture_integration.py`、`test_dependency_compat.py` | 并发/取消关闭、启动回滚重试、端口释放、全局状态隔离及同一 Plan |
-| 管理摘要、观察记录与验收 | `test_maintainability.py`、`test_journal.py`、`test_journal_integration.py`、`test_admin_client.py`、`test_usability_workflow.py` | 过滤/分页、脱敏、保留窗口、终结、真实 CLI 退出码和重置重跑 |
+| 管理摘要、观察记录与验收 | `test_maintainability.py`、`test_journal.py`、`test_journal_integration.py`、`test_admin_client.py`、`test_usability_workflow.py`、`test_reset_contract.py`、`test_large_verification.py` | 过滤/分页、拒绝错误重置范围、脱敏、保留窗口、终结、最大记录容量与响应大小边界、真实 CLI 退出码和重置重跑 |
 | 客户端是否按策略重试 | `test_client_contract.py` | 子进程执行真实示例客户端；429/503、读取超时、尝试上限、非重试状态、响应解码失败，以及第 5/6 次失败、第 7 次固定成功；同时断言客户端与后端结果 |
 | CLI、示例与工具链 | `test_cli.py`、`test_demo.py`、`test_example_catalog.py`、`test_runner.py` | 真实子进程/curl/SIGTERM、完整 YAML 目录的规则可达性、runner 参数传递；安装包另由 `.agent/check-wheel.sh` 验证 |
 
@@ -133,11 +135,13 @@ runner 的 `--help` 与缺少命令提示无需 Docker；实际执行仍全部�
 
 测试后端直接监听端口 0；需要先写入 Config 的端口由 `free_port()` 保证同一测试进程内不重复分配，避免服务/admin 尚未绑定时得到同一端口。该辅助函数不提供跨进程保留保证；监听器测试应在隔离的 runner 网络中执行。
 
-`http1_compat.py` 对 mitmproxy 12.2.3 安装两个局部适配。私有 HTTP/1 reader 工厂在 h11 解析出非空 trailer 时转为协议错误，避免依赖内部抛出未处理的 NotImplementedError；请求侧原生错误路径会先关连接，不能承诺返回 400，响应侧为 502。`expected_http_body_size()` 的适配只让自定义方法 `head` / 混合大小写变体按普通响应定界；使用请求的浅副本，不改变发往后端的原始 method 或上传定界。仅精确 `HEAD` 因方法语义而无响应 body。Addon 将这些自定义方法的完整缓冲、单一 chunked 响应改用 Content-Length，避免依赖省略最后一个 chunk 而破坏 keepalive。
+`http1_compat.py` 对 mitmproxy 12.2.3 安装三个局部适配。私有 HTTP/1 reader 工厂在 h11 解析出非空 trailer 时转为协议错误，避免依赖内部抛出未处理的 NotImplementedError；请求侧原生错误路径会先关连接，不能承诺返回 400，响应侧为 502。`expected_http_body_size()` 的适配只让自定义方法 `head` / 混合大小写变体按普通响应定界；使用请求的浅副本，不改变发往后端的原始 method 或上传定界。仅精确 `HEAD` 因方法语义而无响应 body。Addon 将这些自定义方法的完整缓冲、单一 chunked 响应改用 Content-Length，避免依赖省略最后一个 chunk 而破坏 keepalive。
+
+第三个适配包装 `Http1Client.read_headers()` 的生成器，在原解析器已解析响应头、尚未建立 body reader 或结束流的暂停点消费非 101 的 1xx，再迭代读取最终响应。中间响应不进入 response hooks，不转发给客户端；因此后置故障、Journal 和请求配额只随最终响应推进。每请求最多 100 个中间响应，超过时走正常上游 502 路径；最终响应及错误清理计数，弱引用避免连接对象滞留。101 保留原路径，不借此声明支持升级协议。
 
 这些自定义 HEAD 大小写方法若收到需要读取 body、且使用 `gzip, chunked` 等组合 Transfer-Encoding 的上游响应，会走正常协议错误路径返回 502；不移除编码元数据后转发压缩字节。精确 HEAD、其他方法和 304 等本来无 body 的响应不受此额外限制影响。该错误可能发生在后端已执行之后，Journal 记录 `transport_error`、`status=null`、`upstream_received=false`，也说明后者不能证明后端未执行。
 
-安装前检查依赖版本、两个函数的签名与行为，拒绝覆盖其他适配器；关闭时恢复各自原函数。没有复制整套 HTTP parser，也不静默丢弃 trailer。依赖升级需要同步包元数据、支持版本表和锁文件，重跑真实 HTTP 的方法大小写/后续请求对齐测试，以及源码与已安装 wheel 的双向 trailer 测试；上游原生处理修复后应移除相应适配。`test_dependency_compat.py` 覆盖外部适配冲突、API 漂移、安装/恢复和原请求不变性，`test_http_review.py` 覆盖 mock、after 与透传的真实字节和后端调用。
+安装前检查依赖版本、三个入口的签名与行为，包括中间响应生成器暂停时尚未推进流状态的契约，拒绝覆盖其他适配器；关闭时恢复各自原函数。没有复制整套 HTTP parser，也不静默丢弃 trailer。依赖升级需要同步包元数据、支持版本表和锁文件，重跑真实 HTTP 的方法大小写/后续请求对齐、中间响应/后置动作，以及源码与已安装 wheel 的双向 trailer 测试；上游原生处理修复后应移除相应适配。`test_dependency_compat.py` 覆盖外部适配冲突、API 漂移、安装/恢复和原请求不变性，真实 socket 回归覆盖 mock、after、透传、分片、最终响应缺失与 keepalive。
 
 仓库开发流程是：先明确行为与边界，添加能复现缺失行为或缺陷的测试，再修改实现、独立审查并完成验证。使用 Docker runner 即可执行，不要求安装额外的工作流插件。历史设计决策保存在 [初始设计](superpowers/specs/2026-09-22-fault-engine-design.md) 和 [易用性扩展设计](superpowers/specs/2026-09-29-usability-design.md)；当前行为以实现、使用文档与测试为准。不要把网络异常全部放宽为“任何 exception”来让测试通过；reset 的原始 socket 断言必须保留。
 

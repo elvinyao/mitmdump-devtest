@@ -370,17 +370,34 @@ async def test_deeply_nested_response_is_rejected_before_printing(
     assert output.err == "error: admin server returned an invalid response\n"
 
 
-async def test_oversized_response_is_rejected(admin_server, monkeypatch, capsys):
-    monkeypatch.setattr(admin_client, "MAX_RESPONSE_BYTES", 64)
+@pytest.mark.parametrize(
+    "command,limit_name",
+    [("requests", "MAX_RESPONSE_BYTES"), ("verify", "MAX_VERIFY_RESPONSE_BYTES")],
+)
+async def test_oversized_response_is_rejected(
+    admin_server, monkeypatch, capsys, command, limit_name
+):
+    monkeypatch.setattr(admin_client, limit_name, 64)
     monkeypatch.setenv("FAULT_ADMIN_TOKEN", "secret-bearer")
 
     async def handler(request):
-        return web.json_response({"matched": True, "complete": True, "junk": "x" * 100})
+        return web.json_response(
+            {
+                "matched": True,
+                "complete": True,
+                "requests": [],
+                "checkpoint": "instance:1",
+                "junk": "x" * 100,
+            }
+        )
 
     async with admin_server(handler) as url:
-        args = arguments("verify", "--admin-url", url, "--count", "0")
+        flags = ("--count", "0") if command == "verify" else ()
+        args = arguments(command, "--admin-url", url, *flags)
         assert await asyncio.to_thread(admin_client.run_admin_command, args) == 2
-    assert capsys.readouterr().out == ""
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "exceeded the size limit" in output.err
 
 
 async def test_timeout_is_finite_and_static(admin_server, monkeypatch, capsys):

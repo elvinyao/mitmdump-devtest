@@ -13,6 +13,9 @@ import aiohttp
 
 REQUEST_TIMEOUT_SECONDS = 5
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+# At most 100,000 status/null entries and 99,999 finite float intervals:
+# under 3.4 MB including JSON separators, with room for fixed result fields.
+MAX_VERIFY_RESPONSE_BYTES = 4 * 1024 * 1024
 ADMIN_COMMANDS = frozenset({"requests", "verify", "reset", "journal-clear"})
 
 
@@ -170,6 +173,7 @@ async def _request(
     options: tuple[str, str, dict[str, str], dict[str, object]],
 ) -> dict[str, object]:
     method, path, query, body = options
+    response_limit = MAX_VERIFY_RESPONSE_BYTES if args.command == "verify" else MAX_RESPONSE_BYTES
     try:
         async with aiohttp.ClientSession(
             trust_env=False,
@@ -189,7 +193,7 @@ async def _request(
                     raise AdminClientError("admin HTTP request failed")
                 data = bytearray()
                 async for chunk in response.content.iter_chunked(65536):
-                    if len(data) + len(chunk) > MAX_RESPONSE_BYTES:
+                    if len(data) + len(chunk) > response_limit:
                         raise AdminClientError("admin response exceeded the size limit")
                     data.extend(chunk)
                 try:

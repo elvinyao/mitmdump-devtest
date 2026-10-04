@@ -112,6 +112,11 @@ async def main() -> None:
                     b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
                     b"Connection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
                 )
+            elif calls[-1].startswith(b"GET /interim "):
+                writer.write(
+                    b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n"
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc"
+                )
             else:
                 writer.write(
                     b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
@@ -196,6 +201,13 @@ async def main() -> None:
                 expected=1,
             )
             assert failed["matched"] is False and failed["complete"] is True
+            async with client.post(
+                runtime.admin_url + "/reset?rule=missing",
+                json={},
+                headers={"Authorization": "Bearer wheel-test"},
+            ) as response:
+                assert response.status == 400
+                await response.read()
             assert (await admin_command(runtime, "reset", "--rule", "mock"))["reset"] == 1
             checkpoint = (await admin_command(runtime, "journal-clear"))["checkpoint"]
             await admin_command(runtime, "verify", "--after", checkpoint, "--count", "0")
@@ -231,6 +243,12 @@ async def main() -> None:
                 writer.close()
                 with suppress(OSError):
                     await writer.wait_closed()
+            checkpoint = runtime.journal.checkpoint
+            async with client.get(runtime.url("wheel") + "/interim") as response:
+                assert response.status == 200
+                assert await response.read() == b"abc"
+            assert len(calls) == 3
+            assert runtime.journal.verify(after=checkpoint, count=1, statuses=[200])["matched"]
     finally:
         await runtime.close()
         server.close()
@@ -240,7 +258,8 @@ async def main() -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
     print(
         "Installed wheel: schema, init/validate/explain, admin requests/verify/reset/clear, "
-        "HTTP response, custom method framing, request/response trailer checks passed"
+        "HTTP response, custom method framing, interim response, reset query rejection, "
+        "request/response trailer checks passed"
     )
 
 

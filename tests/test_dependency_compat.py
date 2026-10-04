@@ -63,15 +63,81 @@ def test_install_detects_body_reader_contract_drift(monkeypatch):
 def test_install_is_idempotent_and_restores_exact_original():
     original = http1_compat._http1.make_body_reader
     original_size = http1_compat.http1.expected_http_body_size
+    original_headers = http1_compat._http1.Http1Client.read_headers
     try:
         http1_compat.install()
         http1_compat.install()
         assert http1_compat._http1.make_body_reader is http1_compat._make_body_reader
         assert http1_compat.http1.expected_http_body_size is http1_compat._expected_body_size
+        assert http1_compat._http1.Http1Client.read_headers is http1_compat._read_response_headers
     finally:
         http1_compat.restore()
     assert http1_compat._http1.make_body_reader is original
     assert http1_compat.http1.expected_http_body_size is original_size
+    assert http1_compat._http1.Http1Client.read_headers is original_headers
+
+
+def test_install_preserves_foreign_response_reader_without_partial_install(monkeypatch):
+    original_factory = http1_compat._http1.make_body_reader
+    original_size = http1_compat.http1.expected_http_body_size
+
+    def foreign_reader(self, event):
+        yield from ()
+
+    monkeypatch.setattr(http1_compat._http1.Http1Client, "read_headers", foreign_reader)
+    with pytest.raises(RuntimeError, match="refusing to overwrite"):
+        http1_compat.install()
+    http1_compat.restore()
+    assert http1_compat._http1.Http1Client.read_headers is foreign_reader
+    assert http1_compat._http1.make_body_reader is original_factory
+    assert http1_compat.http1.expected_http_body_size is original_size
+
+
+@pytest.mark.parametrize("drift", ["signature", "no_events", "premature_state"])
+def test_response_reader_contract_drift_fails_without_partial_install(monkeypatch, drift):
+    original_factory = http1_compat._http1.make_body_reader
+    original_size = http1_compat.http1.expected_http_body_size
+    original_reader = http1_compat._original_read_response_headers
+
+    if drift == "signature":
+
+        def changed_reader(message):
+            yield from ()
+
+    else:
+
+        def changed_reader(self, event):
+            if drift == "no_events":
+                return
+            for command in original_reader(self, event):
+                self.response_done = True
+                yield command
+
+    monkeypatch.setattr(http1_compat, "_original_read_response_headers", changed_reader)
+    monkeypatch.setattr(http1_compat._http1.Http1Client, "read_headers", changed_reader)
+    with pytest.raises(RuntimeError, match="response reader API is incompatible"):
+        http1_compat.install()
+    assert http1_compat._http1.make_body_reader is original_factory
+    assert http1_compat.http1.expected_http_body_size is original_size
+    assert http1_compat._http1.Http1Client.read_headers is changed_reader
+
+
+def test_restore_keeps_a_foreign_response_reader_installed_later(monkeypatch):
+    original_factory = http1_compat._http1.make_body_reader
+    original_size = http1_compat.http1.expected_http_body_size
+
+    def foreign_reader(self, event):
+        yield from ()
+
+    http1_compat.install()
+    monkeypatch.setattr(http1_compat._http1.Http1Client, "read_headers", foreign_reader)
+    http1_compat.restore()
+    assert http1_compat._http1.Http1Client.read_headers is foreign_reader
+    assert http1_compat._http1.make_body_reader is original_factory
+    assert http1_compat.http1.expected_http_body_size is original_size
+    # Restore our monkeypatch before cleanup so subsequent tests see originals.
+    monkeypatch.undo()
+    http1_compat.restore()
 
 
 def test_install_preserves_foreign_body_sizing_without_partially_installing(monkeypatch):

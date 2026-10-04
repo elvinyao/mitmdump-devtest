@@ -366,6 +366,8 @@ HTTPS upstream 默认验证证书，系统信任根可直接使用；私有 CA �
 
 后置动作适合验证写入幂等性：例如 POST 已到达后端，但客户端只看到 503 或断连，再重试可能造成第二次写入。它们只在收到完整 HTTP 响应后触发；如果上游连接/TLS 失败或返回不完整响应，保留真实代理错误，不执行替换或后置 reset。是否真正完成业务写入仍需检查后端记录，HTTP 响应本身不是业务提交证明。
 
+上游的 `100 Continue`、`102 Processing`、`103 Early Hints` 等中间响应（不含协议切换 101）会被消费，继续等待最终响应；不会转发 Early Hints，也不会提前触发后置动作、释放请求配额或把 Journal 标记为成功。每次请求最多接受 100 个中间响应，超过上限或上游在最终响应前关闭连接时返回 502。客户端的 `Expect: 100-continue` 仍由代理处理；这不增加 WebSocket/协议切换的支持承诺。
+
 ### 可直接运行的客户端场景
 
 完整演示自动加载 `examples/scenarios.yaml`。[场景手册](scenarios.md)集中维护完整目录、路径、规则 ID、匹配前提、scope 要求和预期结果，另附定向故障、写入重试和循环恢复命令。
@@ -439,7 +441,7 @@ bash .agent/run.sh curl -sS --get -H 'Authorization: Bearer local-demo-token' --
 
 `/rules` 保留原来的 `actions` 名称数组，另提供 `sequence`：每步包含 action/repeat，以及适用的 status/seconds/delay_seconds。`match` 提供 methods/path/path_regex、header_names/query_names；匹配值以本地 YAML 为准。
 
-`{}` 重置全部。filter 不匹配返回 `{"reset":0}`；过期条目不计入 reset 数量，其物理删除分批进行。错误 JSON、未知字段返回 400，未经认证返回 401，超过 4 KiB 的管理请求体返回 413。重置只影响之后的分配，在途请求保留已选动作。
+`{}` 重置全部。filter 不匹配返回 `{"reset":0}`；过期条目不计入 reset 数量，其物理删除分批进行。`POST /reset` 的过滤条件只接受 JSON 字段；URL 带任何查询参数（包括 `?scope=run-1`）都返回 400，且不重置计数，避免误把定向操作变成全局重置。错误 JSON、未知字段返回 400，未经认证返回 401，超过 4 KiB 的管理请求体返回 413。重置只影响之后的分配，在途请求保留已选动作。
 
 ### 请求记录、窗口与验证
 
@@ -455,7 +457,9 @@ outcome 初始为 pending，终结后不再被后续错误覆盖。response_prep
 
 started_at 使用进程单调时钟，仅用于同一实例内比较。**请求进入间隔包含前一次请求的处理耗时，不等于响应结束后的退避等待**；例如 200 ms 慢响应后立即重试，也会满足 100 ms 的进入间隔。当前接口不能证明 Retry-After 遵守、Idempotency-Key 保留或响应后的 backoff；需要客户端/后端专门断言，不能把此项验收结果替代它们。
 
-CLI `requests`、`verify`、`reset`、`journal-clear` 不需要 YAML，默认 `--admin-url http://127.0.0.1:9090`、`--token-env FAULT_ADMIN_TOKEN`。runner 的每次调用都是独立容器，环境变量须在容器内设置；访问另一个已发布代理时使用 `http://host.docker.internal:19090`。真实 token 从指定环境变量读取，不支持明文 token 参数；客户端不跟随重定向、不采用环境代理、总超时 5 秒、响应上限 2 MiB。
+CLI `requests`、`verify`、`reset`、`journal-clear` 不需要 YAML，默认 `--admin-url http://127.0.0.1:9090`、`--token-env FAULT_ADMIN_TOKEN`。runner 的每次调用都是独立容器，环境变量须在容器内设置；访问另一个已发布代理时使用 `http://host.docker.internal:19090`。真实 token 从指定环境变量读取，不支持明文 token 参数；客户端不跟随重定向、不采用环境代理、总超时 5 秒。`verify` 响应上限为 4 MiB，容纳最多 100000 条记录的状态和间隔结果；其他命令保持 2 MiB。大小按解压后的响应体累计，分块传输同样受限。
+
+大窗口可使用 `verify --count 100000 --min-interval-seconds 0` 检查次数和间隔；记录容量需相应配置，且证据未被淘汰。管理请求体仍限制为 4 KiB，因此不能一次提交十万项 `--statuses`。需要逐条状态检查时可用 `requests` 分页读取，并检查每页的 complete 与 next_cursor；单页过大时降低 `--limit`。
 
 | 退出码 | 含义 |
 | --- | --- |

@@ -127,6 +127,11 @@ def make_admin(
         )
 
     async def reset(request: web.Request) -> web.Response:
+        if request.query:
+            return web.json_response(
+                {"error": "use JSON reset filters; query parameters are not allowed"},
+                status=400,
+            )
         try:
             selection = CounterSelection.model_validate(await request.json())
         except (json.JSONDecodeError, UnicodeDecodeError, ValidationError):
